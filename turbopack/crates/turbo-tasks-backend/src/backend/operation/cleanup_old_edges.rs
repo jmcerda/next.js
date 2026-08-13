@@ -54,6 +54,29 @@ pub enum OutdatedEdge {
     CollectiblesDependency(CollectiblesRef),
 }
 
+/// Captures *all* of a task's outgoing edges as [`OutdatedEdge`]s
+pub fn capture_all_outgoing_edges(task: &impl TaskStorageAccessors) -> Vec<OutdatedEdge> {
+    let mut old_edges: Vec<OutdatedEdge> = Vec::new();
+    old_edges.extend(task.iter_children().map(OutdatedEdge::Child));
+    old_edges.extend(
+        task.iter_output_dependencies()
+            .map(OutdatedEdge::OutputDependency),
+    );
+    old_edges.extend(
+        task.iter_cell_dependencies()
+            .map(OutdatedEdge::CellDependency),
+    );
+    old_edges.extend(
+        task.iter_cell_dependencies_hashed()
+            .map(|(r, k)| OutdatedEdge::HashedCellDependency(r, k)),
+    );
+    old_edges.extend(
+        task.iter_collectibles_dependencies()
+            .map(OutdatedEdge::CollectiblesDependency),
+    );
+    old_edges
+}
+
 #[cfg(feature = "trace_aggregation_update_stats")]
 type Stats = super::aggregation_update::AggregationUpdateQueueStats;
 #[cfg(not(feature = "trace_aggregation_update_stats"))]

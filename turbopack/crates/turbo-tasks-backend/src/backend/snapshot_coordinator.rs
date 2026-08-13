@@ -1,15 +1,20 @@
-//! Coordinator that gates concurrent operations against snapshotting.
+//! Coordinator that gates concurrent operations against snapshotting and garbage collection.
 //!
-//! Backend operations and snapshot work share a single [`SnapshotCoordinator`]
-//! that enforces the protocol:
+//! Backend operations, snapshot work, and garbage collection share a single
+//! [`SnapshotCoordinator`] that enforces the protocol:
 //!
-//! - When no snapshot is in flight, [`begin_operation`](SnapshotCoordinator::begin_operation) is a
-//!   single uncontended atomic increment.
-//! - When a snapshot is requested, new operations block until the snapshot finishes, and operations
-//!   already in flight either complete or call
+//! - When neither a snapshot nor a GC pass is in flight,
+//!   [`begin_operation`](SnapshotCoordinator::begin_operation) is a single uncontended atomic
+//!   increment.
+//! - When a snapshot or GC pass is requested, new operations block until it finishes, and
+//!   operations already in flight either complete or call
 //!   [`suspend_point`](SnapshotCoordinator::suspend_point) to suspend.
-//! - The snapshotter waits for every in-flight operation to drain or suspend, takes its snapshot,
-//!   then wakes everyone.
+//! - The snapshotter / collector waits for every in-flight operation to drain or suspend, does its
+//!   work, then wakes everyone.
+//!
+//! Snapshots and GC use two distinct request bits ([`SNAPSHOT_REQUESTED_BIT`] and
+//! [`GC_REQUESTED_BIT`]); operations drain/suspend for either. Snapshots and GC are mutually
+//! exclusive; callers must serialize them (the `snapshot_in_progress` mutex in `mod.rs`).
 
 use std::sync::{
     Arc,
@@ -18,17 +23,51 @@ use std::sync::{
 
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashSet;
+use tracing::info_span;
 
 use crate::{backend::AnyOperation, utils::ptr_eq_arc::PtrEqArc};
 
-/// High bit: set while a snapshot is requested or in flight.
-/// Low bits: count of operations currently executing (not suspended).
+/// Runs `f` (which blocks a whole OS thread) after handing this thread's tokio worker slot back to
+/// the scheduler, so the runtime can keep making progress while we sit on a condvar.
+///
+/// Required for liveness in [`begin_exclusion`](SnapshotCoordinator::begin_exclusion): snapshot/GC
+/// runs as a `tokio::spawn` background job, so it parks on a worker while waiting on operations
+/// that themselves need workers to be polled. Without the hand-off a single-worker (or fully
+/// contended) runtime deadlocks. Elsewhere (`begin_operation`, `suspend_point`) it is throughput
+/// only: the pass runs regardless, but parking a worker starves whatever else could have used it.
+///
+/// `block_in_place` panics off a multi-thread runtime worker, so fall back to calling `f` directly:
+/// on a current-thread runtime or a plain thread there is no worker slot to give back.
+fn block_off_runtime<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// Top bit: set while a snapshot is requested or in flight.
 const SNAPSHOT_REQUESTED_BIT: usize = 1 << (usize::BITS - 1);
+/// Second-from-top bit: set while a garbage-collection pass is requested or in flight.
+const GC_REQUESTED_BIT: usize = 1 << (usize::BITS - 2);
+/// Mask of all "exclusion requested" bits. Operations must drain/suspend while any is set.
+/// The remaining low bits hold the count of operations currently executing (not suspended).
+const REQUEST_BITS: usize = SNAPSHOT_REQUESTED_BIT | GC_REQUESTED_BIT;
+
+/// Whether an `in_progress_operations` value represents a fully-drained state that a waiting
+/// snapshotter/collector should be woken for: at least one request bit is set (someone is waiting
+/// to drain) and the operation count (low bits) has reached zero.
+#[inline]
+fn is_drained(value: usize) -> bool {
+    (value & REQUEST_BITS) != 0 && (value & !REQUEST_BITS) == 0
+}
 
 /// State protected by the mutex.
 struct State<O> {
     /// `true` between `begin_snapshot` and `SnapshotPhase::drop`.
     snapshot_requested: bool,
+    /// `true` between `begin_gc` and `GcPhase::drop`.
+    gc_requested: bool,
     /// Operations that called [`SnapshotCoordinator::suspend_point`] and have
     /// not yet resumed. Returned to the snapshotter via
     /// [`SnapshotPhase::suspended_operations`] so it can persist them in the
@@ -36,21 +75,21 @@ struct State<O> {
     suspended_operations: FxHashSet<PtrEqArc<O>>,
 }
 
-/// Coordinates operation/snapshot interleaving.
+/// Coordinates operation/snapshot/GC interleaving.
 ///
 /// Generic over the operation type the caller wants to suspend. The
 /// coordinator only requires `O: Send + Sync + 'static`; it never inspects
 /// the value, just stores it via [`PtrEqArc`].
 pub struct SnapshotCoordinator<O = AnyOperation> {
-    /// Combined count + bit. See [`SNAPSHOT_REQUESTED_BIT`].
+    /// Combined count + request bits. See [`SNAPSHOT_REQUESTED_BIT`], [`GC_REQUESTED_BIT`].
     in_progress_operations: AtomicUsize,
     state: Mutex<State<O>>,
-    /// Notified by the last operation to drain (count drops to `BIT` while
-    /// `SNAPSHOT_REQUESTED_BIT` is set). Awaited by [`begin_snapshot`].
+    /// Notified by the last operation to drain (count drops to zero while a request bit is set).
+    /// Awaited by [`SnapshotCoordinator::begin_snapshot`] and [`SnapshotCoordinator::begin_gc`].
     operations_drained: Condvar,
-    /// Notified by [`SnapshotPhase::drop`]. Awaited by operations that hit a
-    /// suspend point or arrive while a snapshot is in flight.
-    snapshot_completed: Condvar,
+    /// Notified by [`SnapshotPhase::drop`] and [`GcPhase::drop`]. Awaited by operations that hit a
+    /// suspend point or arrive while a snapshot or GC pass is in flight.
+    exclusion_completed: Condvar,
 }
 
 impl<O> Default for SnapshotCoordinator<O> {
@@ -65,58 +104,63 @@ impl<O> SnapshotCoordinator<O> {
             in_progress_operations: AtomicUsize::new(0),
             state: Mutex::new(State {
                 snapshot_requested: false,
+                gc_requested: false,
                 suspended_operations: FxHashSet::default(),
             }),
             operations_drained: Condvar::new(),
-            snapshot_completed: Condvar::new(),
+            exclusion_completed: Condvar::new(),
         }
     }
 
-    /// Cheap check used by hot paths. Returns `true` while a snapshot is in
-    /// flight (or being requested). May return `false` racily if a snapshot
-    /// is just about to start; the actual coordination happens in
-    /// [`suspend_point`](Self::suspend_point) and [`begin_operation`](Self::begin_operation).
-    pub fn snapshot_pending(&self) -> bool {
-        // Acquire so that observing the bit synchronizes with anything the
-        // snapshotter wrote before setting it.
-        (self.in_progress_operations.load(Ordering::Acquire) & SNAPSHOT_REQUESTED_BIT) != 0
+    /// Cheap check used by hot paths. Returns `true` while a snapshot or GC pass is in flight (or
+    /// being requested). May return `false` racily if one is just about to start; the actual
+    /// coordination happens in [`suspend_point`](Self::suspend_point) and
+    /// [`begin_operation`](Self::begin_operation).
+    pub fn exclusion_pending(&self) -> bool {
+        // Acquire so that observing a request bit synchronizes with anything the snapshotter /
+        // collector wrote before setting it.
+        (self.in_progress_operations.load(Ordering::Acquire) & REQUEST_BITS) != 0
+    }
+
+    /// Whether a GC phase is currently held. Used by the GC-only execute context to
+    /// `debug_assert` it is running under the exclusion it requires.
+    pub fn gc_in_progress(&self) -> bool {
+        (self.in_progress_operations.load(Ordering::Acquire) & GC_REQUESTED_BIT) != 0
     }
 
     /// Begin an operation. Returns a guard that decrements on drop.
     ///
-    /// If a snapshot is in flight, blocks until the snapshot finishes before
-    /// returning the guard.
+    /// If a snapshot or GC pass is in flight, blocks until it finishes before returning the guard.
     pub fn begin_operation(&self) -> OperationGuard<'_, O> {
-        // Fast path: no snapshot in flight, single atomic increment.
+        // Fast path: no snapshot or GC in flight, single atomic increment.
         let prev = self.in_progress_operations.fetch_add(1, Ordering::AcqRel);
-        if (prev & SNAPSHOT_REQUESTED_BIT) == 0 {
+        if (prev & REQUEST_BITS) == 0 {
             return OperationGuard { coord: Some(self) };
         }
         #[cold]
-        fn wait_for_snapshot_to_complete<O>(this: &SnapshotCoordinator<O>) {
+        fn wait_for_exclusion_to_complete<O>(this: &SnapshotCoordinator<O>) {
             // We arrive here holding our +1 (the fetch_add in begin_operation).
             // Two cases:
-            //   - Snapshot is still in flight: back out our +1, wait for it to finish, then re-add.
-            //     The drop balances the re-add.
-            //   - Snapshot already finished between our fetch_add and acquiring this mutex: leave
-            //     our +1 in place; the drop balances it directly. No extra atomics needed.
+            //   - A snapshot/GC pass is still in flight: back out our +1, wait for it to finish,
+            //     then re-add. The drop balances the re-add.
+            //   - It already finished between our fetch_add and acquiring this mutex: leave our +1
+            //     in place; the drop balances it directly. No extra atomics needed.
             let mut state = this.state.lock();
-            if state.snapshot_requested {
+            if state.snapshot_requested || state.gc_requested {
                 let prev = this.in_progress_operations.fetch_sub(1, Ordering::AcqRel);
-                if prev - 1 == SNAPSHOT_REQUESTED_BIT {
+                if is_drained(prev - 1) {
                     this.operations_drained.notify_all();
                 }
-                this.snapshot_completed
-                    .wait_while(&mut state, |s| s.snapshot_requested);
-                // Re-add now that the snapshot is done. Bit is cleared because
-                // we just observed `snapshot_requested == false` under the
-                // mutex.
+                block_off_runtime(|| {
+                    this.exclusion_completed
+                        .wait_while(&mut state, |s| s.snapshot_requested || s.gc_requested);
+                });
+                // Re-add now that the exclusion is done. Both bits are cleared because we just
+                // observed both flags false under the mutex.
                 this.in_progress_operations.fetch_add(1, Ordering::AcqRel);
             }
         }
-        // Slow path: a snapshot is in flight (or just requested). Back out
-        // the increment, wait for the snapshot to complete, then re-increment.
-        wait_for_snapshot_to_complete(self);
+        wait_for_exclusion_to_complete(self);
         OperationGuard { coord: Some(self) }
     }
 
@@ -125,36 +169,38 @@ impl<O> SnapshotCoordinator<O> {
     /// produce a handle to this operation so the snapshotter can persist it
     /// for replay on the next startup.
     pub fn suspend_point(&self, suspend: impl FnOnce() -> O) {
-        if !self.snapshot_pending() {
+        if !self.exclusion_pending() {
             return;
         }
         #[cold]
         fn suspend_point_cold<O>(this: &SnapshotCoordinator<O>, suspend: impl FnOnce() -> O) {
-            let op = Arc::new(suspend());
             let mut state = this.state.lock();
-            if !state.snapshot_requested {
-                // Race: snapshot finished between the `snapshot_pending` check
-                // and acquiring the mutex. Nothing to do.
+            if !state.snapshot_requested && !state.gc_requested {
+                // Race: the snapshot/GC pass finished between the `exclusion_pending` check and
+                // acquiring the mutex. Nothing to do.
                 return;
             }
+            let op = Arc::new(suspend());
             state
                 .suspended_operations
                 .insert(PtrEqArc::from(op.clone()));
-            // Decrement the count so the snapshotter can drain.
+            // Decrement the count so the snapshotter / collector can drain.
             let prev = this.in_progress_operations.fetch_sub(1, Ordering::AcqRel);
             // Protocol violation if either invariant fails. Keep as a regular
             // `assert!` so production builds also catch it: the alternative is
-            // a corrupted counter that hangs the next snapshot indefinitely.
+            // a corrupted counter that hangs the next snapshot/GC indefinitely.
             assert!(
-                (prev & SNAPSHOT_REQUESTED_BIT) != 0 && (prev & !SNAPSHOT_REQUESTED_BIT) > 0,
+                (prev & REQUEST_BITS) != 0 && (prev & !REQUEST_BITS) > 0,
                 "suspend_point called without a live operation: prev={prev:#x}"
             );
-            if prev - 1 == SNAPSHOT_REQUESTED_BIT {
+            if is_drained(prev - 1) {
                 this.operations_drained.notify_all();
             }
-            // Wait for the snapshot to finish.
-            this.snapshot_completed
-                .wait_while(&mut state, |s| s.snapshot_requested);
+            // Wait for the snapshot / GC pass to finish.
+            block_off_runtime(|| {
+                this.exclusion_completed
+                    .wait_while(&mut state, |s| s.snapshot_requested || s.gc_requested);
+            });
             // Resume: re-increment and remove ourselves from the suspended set.
             this.in_progress_operations.fetch_add(1, Ordering::AcqRel);
             state.suspended_operations.remove(&PtrEqArc::from(op));
@@ -162,56 +208,126 @@ impl<O> SnapshotCoordinator<O> {
         suspend_point_cold(self, suspend);
     }
 
+    /// Shared core of [`begin_snapshot`](Self::begin_snapshot) and [`begin_gc`](Self::begin_gc):
+    /// sets the request flag + bit and blocks until every in-flight operation has drained or
+    /// suspended. Returns the **still-held** state lock so the caller can read
+    /// `suspended_operations` before releasing it.
+    fn begin_exclusion(
+        &self,
+        what: Exclusion,
+        set_requested: impl FnOnce(&mut State<O>),
+    ) -> parking_lot::MutexGuard<'_, State<O>> {
+        let request_bit = what.request_bit();
+        let mut state = self.state.lock();
+        assert!(
+            !state.snapshot_requested && !state.gc_requested,
+            "{} called while a {} was already in flight (snapshot and GC must be serialized)",
+            what.begin_fn(),
+            if state.snapshot_requested {
+                "snapshot"
+            } else {
+                "GC pass"
+            }
+        );
+        set_requested(&mut state);
+        // AcqRel so the writes leading up to setting the bit are visible to the operation hot
+        // path's Acquire load in `exclusion_pending`.
+        let active = self
+            .in_progress_operations
+            .fetch_or(request_bit, Ordering::AcqRel);
+        assert!(
+            (active & request_bit) == 0,
+            "{} request bit was already set when {} ran: {active:#x}",
+            what.label(),
+            what.begin_fn()
+        );
+        if (active & !REQUEST_BITS) != 0 {
+            // The predicate is Acquire-loaded so we synchronize with the AcqRel decrement that woke
+            // us. This can block for a while under load (until every in-flight operation reaches a
+            // suspend point or finishes), so it gets its own span for latency attribution.
+            let num_operations = active & !REQUEST_BITS;
+            let _span = match what {
+                Exclusion::Snapshot => {
+                    info_span!("snapshot: await operations settle", num_operations)
+                }
+                Exclusion::Gc => info_span!("gc: await operations settle", num_operations),
+            }
+            .entered();
+            // Release our worker thread so pending operations have it available. This preserves
+            // liveness. See `block_off_runtime`.
+            block_off_runtime(|| {
+                self.operations_drained.wait_while(&mut state, |_| {
+                    (self.in_progress_operations.load(Ordering::Acquire) & !REQUEST_BITS) != 0
+                });
+            });
+        }
+        state
+    }
+
     /// Begin a snapshot. Sets the snapshot bit, blocks until all in-flight
     /// operations have drained or suspended, and returns a [`SnapshotPhase`]
     /// guard that releases the bit on drop.
     ///
-    /// Concurrent callers panic via the debug assertion. Production callers
-    /// must serialize themselves (see `snapshot_in_progress` lock in
-    /// `mod.rs`); the coordinator does not own that mutex because some
-    /// callers want to interleave additional work between phases.
+    /// Concurrent callers panic.
     pub fn begin_snapshot(&self) -> SnapshotPhase<'_, O> {
-        let mut state = self.state.lock();
-        // Protocol violation: callers must serialize snapshots themselves.
-        // Promoted from debug_assert: silently ignoring this leads directly
-        // to a stuck counter and a hung process.
-        assert!(
-            !state.snapshot_requested,
-            "begin_snapshot called while another snapshot was already in flight"
-        );
-        state.snapshot_requested = true;
-        // AcqRel so the writes leading up to setting the bit are visible to
-        // the operation hot path's Acquire load in `snapshot_pending`.
-        let active = self
-            .in_progress_operations
-            .fetch_or(SNAPSHOT_REQUESTED_BIT, Ordering::AcqRel);
-        assert!(
-            (active & SNAPSHOT_REQUESTED_BIT) == 0,
-            "snapshot bit was already set when begin_snapshot ran: {active:#x}"
-        );
-        if (active & !SNAPSHOT_REQUESTED_BIT) != 0 {
-            // Some operations are in flight. Wait for them to drain or
-            // suspend. The predicate is Acquire-loaded so we synchronize
-            // with the AcqRel decrement that woke us.
-            self.operations_drained.wait_while(&mut state, |_| {
-                self.in_progress_operations.load(Ordering::Acquire) != SNAPSHOT_REQUESTED_BIT
-            });
-        }
-        // Snapshot ranges that follow can read the suspended_operations
-        // list; we leave the mutex held until the caller drops the phase.
+        let state = self.begin_exclusion(Exclusion::Snapshot, |s| s.snapshot_requested = true);
+        // Snapshot ranges that follow can read the suspended_operations list; we read it while
+        // still holding the lock, then release so the snapshotter does the heavy work
+        // without it. Operations attempting to start during this window observe the bit set
+        // and either suspend or wait on `exclusion_completed`.
         let suspended_operations: Vec<Arc<O>> = state
             .suspended_operations
             .iter()
             .map(|op| op.arc().clone())
             .collect();
-        // Release the mutex now — the snapshotter does the heavy work
-        // without holding it. Operations attempting to start during this
-        // window observe the bit set and either suspend or wait on
-        // `snapshot_completed`.
         drop(state);
         SnapshotPhase {
             coord: self,
             suspended_operations,
+        }
+    }
+
+    /// Begin a garbage-collection pass, returning a [`GcPhase`] guard that releases the exclusion
+    /// on drop. While the guard is held no operation can be running, so the collector may
+    /// mutate the task graph without racing.
+    ///
+    /// Concurrent callers panic.
+    pub fn begin_gc(&self) -> GcPhase<'_, O> {
+        let state = self.begin_exclusion(Exclusion::Gc, |s| s.gc_requested = true);
+        drop(state);
+        GcPhase { coord: self }
+    }
+}
+
+/// Which kind of exclusion [`SnapshotCoordinator::begin_exclusion`] is starting. Selects the
+/// request bit and the labels used in assertion messages and the drain span.
+#[derive(Clone, Copy)]
+enum Exclusion {
+    Snapshot,
+    Gc,
+}
+
+impl Exclusion {
+    fn request_bit(self) -> usize {
+        match self {
+            Exclusion::Snapshot => SNAPSHOT_REQUESTED_BIT,
+            Exclusion::Gc => GC_REQUESTED_BIT,
+        }
+    }
+
+    /// Human label for the exclusion kind, for assertion messages.
+    fn label(self) -> &'static str {
+        match self {
+            Exclusion::Snapshot => "snapshot",
+            Exclusion::Gc => "GC",
+        }
+    }
+
+    /// Name of the public entry point, for assertion messages.
+    fn begin_fn(self) -> &'static str {
+        match self {
+            Exclusion::Snapshot => "begin_snapshot",
+            Exclusion::Gc => "begin_gc",
         }
     }
 }
@@ -241,10 +357,10 @@ impl<O> Drop for OperationGuard<'_, O> {
         // promoted from debug_assert because the alternative is silently
         // wrapping to usize::MAX and breaking every subsequent snapshot.
         assert!(
-            (prev & !SNAPSHOT_REQUESTED_BIT) > 0,
+            (prev & !REQUEST_BITS) > 0,
             "OperationGuard::drop underflow: in_progress_operations was {prev:#x}"
         );
-        if prev - 1 == SNAPSHOT_REQUESTED_BIT {
+        if is_drained(prev - 1) {
             #[cold]
             fn notify_drained<O>(coord: &SnapshotCoordinator<O>) {
                 // Take the state mutex around `notify_all`. This is defensive against
@@ -254,7 +370,7 @@ impl<O> Drop for OperationGuard<'_, O> {
                 // (not under the user mutex), so a notifier that has never synchronized
                 // with the user mutex can racily observe stale null and drop the notify.
                 //
-                // It is generally a best practice to only notify under the loc
+                // It is generally a best practice to only notify under the lock
                 let _g = coord.state.lock();
                 coord.operations_drained.notify_all();
             }
@@ -300,7 +416,72 @@ impl<O> Drop for SnapshotPhase<'_, O> {
         );
         // Notify everyone waiting for the snapshot to finish under the
         // mutex (correctness against parking_lot's notify_all fast path).
-        self.coord.snapshot_completed.notify_all();
+        self.coord.exclusion_completed.notify_all();
+    }
+}
+
+/// Guard returned by [`SnapshotCoordinator::begin_gc`]. Holds the GC bit; on drop, releases it and
+/// wakes any operations parked on `exclusion_completed`.
+pub struct GcPhase<'a, O> {
+    coord: &'a SnapshotCoordinator<O>,
+}
+
+impl<'a, O> GcPhase<'a, O> {
+    /// Atomically transitions from the GC phase directly into a snapshot phase
+    pub fn into_snapshot(self) -> SnapshotPhase<'a, O> {
+        let coord = self.coord;
+        // Do not run `GcPhase::Drop` — we are handing the exclusion off to the snapshot phase, not
+        // releasing it. `forget` leaves the GC bit set; we clear it (and set the snapshot bit)
+        // below under the lock.
+        std::mem::forget(self);
+
+        let mut state = coord.state.lock();
+        debug_assert!(state.gc_requested, "into_snapshot: GC phase was not active");
+        debug_assert!(
+            !state.snapshot_requested,
+            "into_snapshot: a snapshot was already in flight"
+        );
+        state.gc_requested = false;
+        state.snapshot_requested = true;
+        // Swap the bits atomically: clear GC, set snapshot, in one AcqRel RMW. Operations that
+        // observe the value either before or after still see a request bit set, so none can start.
+        let prev = coord.in_progress_operations.fetch_add(
+            SNAPSHOT_REQUESTED_BIT.wrapping_sub(GC_REQUESTED_BIT),
+            Ordering::AcqRel,
+        );
+        assert!(
+            (prev & GC_REQUESTED_BIT) != 0 && (prev & SNAPSHOT_REQUESTED_BIT) == 0,
+            "into_snapshot: unexpected request bits {prev:#x}"
+        );
+
+        let suspended_operations: Vec<Arc<O>> = state
+            .suspended_operations
+            .iter()
+            .map(|op| op.arc().clone())
+            .collect();
+        drop(state);
+        SnapshotPhase {
+            coord,
+            suspended_operations,
+        }
+    }
+}
+
+impl<O> Drop for GcPhase<'_, O> {
+    fn drop(&mut self) {
+        let mut state = self.coord.state.lock();
+        state.gc_requested = false;
+        let prev = self
+            .coord
+            .in_progress_operations
+            .fetch_sub(GC_REQUESTED_BIT, Ordering::AcqRel);
+        assert!(
+            (prev & GC_REQUESTED_BIT) != 0,
+            "GcPhase::drop: GC bit was already cleared (prev={prev:#x})"
+        );
+        // Notify everyone waiting for the exclusion to finish, under the mutex (correctness against
+        // parking_lot's notify_all fast path).
+        self.coord.exclusion_completed.notify_all();
     }
 }
 
@@ -326,7 +507,7 @@ mod tests {
     /// fixed `thread::sleep` waits — those introduced both flakiness (too
     /// short) and slowness (too long).
     fn wait_for_snapshot_pending<O>(coord: &SnapshotCoordinator<O>) {
-        while !coord.snapshot_pending() {
+        while !coord.exclusion_pending() {
             thread::yield_now();
         }
     }
@@ -334,7 +515,7 @@ mod tests {
     #[test]
     fn no_snapshot_pending_initially() {
         let coord = SnapshotCoordinator::<Op>::new();
-        assert!(!coord.snapshot_pending());
+        assert!(!coord.exclusion_pending());
     }
 
     #[test]
@@ -346,48 +527,129 @@ mod tests {
         assert_eq!(coord.in_progress_operations.load(Ordering::Acquire), 0);
     }
 
+    /// The exclusion kinds each shared-behaviour test below runs against. `begin_snapshot` and
+    /// `begin_gc` both delegate to `begin_exclusion`, differing only in which request flag the
+    /// closure sets — so these behaviours are covered once per kind here rather than in a pair of
+    /// near-identical tests per behaviour. GC-specific behaviour (the `into_snapshot` handoff, the
+    /// mutual-exclusion panics) is tested separately below.
+    ///
+    /// A trait rather than a table of fn pointers because the phase borrows the coordinator, and a
+    /// `fn` pointer would force that borrow to `'static`.
+    trait Exclusive {
+        /// Human label used in assertion messages.
+        const LABEL: &'static str;
+        /// Whether this kind exposes the suspended-operation list (`GcPhase` does not).
+        const REPORTS_SUSPENDED: bool;
+        /// Guard whose `Drop` ends the exclusion.
+        type Phase<'a>;
+
+        /// Begins the exclusion, returning the guard and the number of operations that suspended to
+        /// let it start (0 when the kind does not report them).
+        fn begin(coord: &SnapshotCoordinator<Op>) -> (Self::Phase<'_>, usize);
+    }
+
+    struct SnapshotKind;
+    impl Exclusive for SnapshotKind {
+        const LABEL: &'static str = "snapshot";
+        const REPORTS_SUSPENDED: bool = true;
+        type Phase<'a> = SnapshotPhase<'a, Op>;
+
+        fn begin(coord: &SnapshotCoordinator<Op>) -> (Self::Phase<'_>, usize) {
+            let phase = coord.begin_snapshot();
+            let suspended = phase.suspended_operations().len();
+            (phase, suspended)
+        }
+    }
+
+    struct GcKind;
+    impl Exclusive for GcKind {
+        const LABEL: &'static str = "gc";
+        const REPORTS_SUSPENDED: bool = false;
+        type Phase<'a> = GcPhase<'a, Op>;
+
+        fn begin(coord: &SnapshotCoordinator<Op>) -> (Self::Phase<'_>, usize) {
+            (coord.begin_gc(), 0)
+        }
+    }
+
+    fn no_ops_proceeds_immediately<E: Exclusive>() {
+        let coord = SnapshotCoordinator::<Op>::new();
+        let (phase, suspended) = E::begin(&coord);
+        assert!(
+            coord.exclusion_pending(),
+            "{}: exclusion should be pending",
+            E::LABEL
+        );
+        assert_eq!(
+            suspended,
+            0,
+            "{}: nothing was running, so nothing suspended",
+            E::LABEL
+        );
+        drop(phase);
+        assert!(
+            !coord.exclusion_pending(),
+            "{}: dropping the phase must clear the request",
+            E::LABEL
+        );
+    }
+
     #[test]
     fn snapshot_with_no_ops_proceeds_immediately() {
-        let coord = SnapshotCoordinator::<Op>::new();
-        let phase = coord.begin_snapshot();
-        assert!(coord.snapshot_pending());
-        assert!(phase.suspended_operations().is_empty());
-        drop(phase);
-        assert!(!coord.snapshot_pending());
+        no_ops_proceeds_immediately::<SnapshotKind>();
+    }
+
+    #[test]
+    fn gc_with_no_ops_proceeds_immediately() {
+        no_ops_proceeds_immediately::<GcKind>();
+    }
+
+    fn waits_for_ops_to_drain<E: Exclusive>() {
+        let coord = Arc::new(SnapshotCoordinator::<Op>::new());
+        let g = coord.begin_operation();
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let coord2 = coord.clone();
+        let thread = thread::spawn({
+            let started = started.clone();
+            move || {
+                let _phase = E::begin(&coord2);
+                started.store(1, Ordering::Release);
+            }
+        });
+
+        // The pass can't proceed past `begin_*` while we hold `g`.
+        wait_for_snapshot_pending(&coord);
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            0,
+            "{}: must not start while an operation is in flight",
+            E::LABEL
+        );
+
+        drop(g);
+        thread.join().unwrap();
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            1,
+            "{}: must proceed once operations drain",
+            E::LABEL
+        );
     }
 
     #[test]
     fn snapshot_waits_for_ops_to_drain() {
-        let coord = Arc::new(SnapshotCoordinator::<Op>::new());
-
-        let g = coord.begin_operation();
-        let started_snapshot = Arc::new(AtomicUsize::new(0));
-
-        let coord2 = coord.clone();
-        let snap_thread = thread::spawn({
-            let started_snapshot = started_snapshot.clone();
-            move || {
-                let _phase = coord2.begin_snapshot();
-                started_snapshot.store(1, Ordering::Release);
-            }
-        });
-
-        // Wait for the snapshotter to set the bit. It can't make progress
-        // past begin_snapshot while we hold `g`, so started_snapshot must
-        // still be 0.
-        wait_for_snapshot_pending(&coord);
-        assert_eq!(started_snapshot.load(Ordering::Acquire), 0);
-
-        // Drop the operation — snapshotter should now proceed.
-        drop(g);
-        snap_thread.join().unwrap();
-        assert_eq!(started_snapshot.load(Ordering::Acquire), 1);
+        waits_for_ops_to_drain::<SnapshotKind>();
     }
 
     #[test]
-    fn new_operation_blocks_during_snapshot() {
+    fn gc_waits_for_ops_to_drain() {
+        waits_for_ops_to_drain::<GcKind>();
+    }
+
+    fn new_operation_blocks_during<E: Exclusive>() {
         let coord = Arc::new(SnapshotCoordinator::<Op>::new());
-        let phase = coord.begin_snapshot();
+        let (phase, _) = E::begin(&coord);
         let started_op = Arc::new(AtomicUsize::new(0));
         let arrived = Arc::new(AtomicUsize::new(0));
 
@@ -402,52 +664,108 @@ mod tests {
             }
         });
 
-        // Wait until the worker is alive and about to call begin_operation.
-        // We can't directly observe it entering begin_operation (its
-        // fetch_add is transient — it backs out and parks before we can
-        // sample), but since we hold `phase` the worker provably cannot
-        // set started_op=1 from anywhere inside begin_operation. So
-        // observing started_op==0 after the worker is running and on its
-        // way into begin_operation is a real check, not a vacuous one.
+        // Wait until the worker is alive and about to call begin_operation. We can't directly
+        // observe it entering begin_operation (its fetch_add is transient — it backs out and parks
+        // before we can sample), but since we hold `phase` the worker provably cannot set
+        // started_op=1 from anywhere inside begin_operation. So observing started_op==0 after the
+        // worker is running and on its way in is a real check, not a vacuous one.
         while arrived.load(Ordering::Acquire) == 0 {
             thread::yield_now();
         }
-        assert_eq!(started_op.load(Ordering::Acquire), 0);
+        assert_eq!(
+            started_op.load(Ordering::Acquire),
+            0,
+            "{}: a new operation must block while the exclusion is held",
+            E::LABEL
+        );
 
         drop(phase);
         op_thread.join().unwrap();
-        assert_eq!(started_op.load(Ordering::Acquire), 1);
+        assert_eq!(
+            started_op.load(Ordering::Acquire),
+            1,
+            "{}: the operation must run once the exclusion ends",
+            E::LABEL
+        );
     }
 
     #[test]
-    fn suspend_point_lets_snapshot_proceed() {
+    fn new_operation_blocks_during_snapshot() {
+        new_operation_blocks_during::<SnapshotKind>();
+    }
+
+    #[test]
+    fn new_operation_blocks_during_gc() {
+        new_operation_blocks_during::<GcKind>();
+    }
+
+    /// `suspend_point` lets a waiting pass proceed, and (for a snapshot) the suspended operation is
+    /// recorded so it can be replayed.
+    fn suspend_point_lets_exclusion_proceed<E: Exclusive>() {
         let coord = Arc::new(SnapshotCoordinator::<Op>::new());
         let g = coord.begin_operation();
 
-        let snapshotter_done = Arc::new(AtomicUsize::new(0));
-        let coord_snap = coord.clone();
+        let done = Arc::new(AtomicUsize::new(0));
+        let coord2 = coord.clone();
 
-        let snap_thread = thread::spawn({
-            let snapshotter_done = snapshotter_done.clone();
+        let pass_thread = thread::spawn({
+            let done = done.clone();
             move || {
-                let phase = coord_snap.begin_snapshot();
-                assert_eq!(phase.suspended_operations().len(), 1);
-                snapshotter_done.store(1, Ordering::Release);
-                // Hold the snapshot for a moment so the suspend_point thread
-                // observes `snapshot_requested == true` after waking.
+                let (phase, suspended) = E::begin(&coord2);
+                if E::REPORTS_SUSPENDED {
+                    assert_eq!(
+                        suspended,
+                        1,
+                        "{}: must record the suspended operation for replay",
+                        E::LABEL
+                    );
+                }
+                done.store(1, Ordering::Release);
+                // Hold the exclusion briefly so the suspend_point thread observes the request flag
+                // still set after waking.
                 thread::sleep(Duration::from_millis(20));
+                drop(phase);
             }
         });
 
         wait_for_snapshot_pending(&coord);
-        // Snapshotter is now waiting for our operation to drain. Calling
-        // suspend_point should let it proceed.
-        coord.suspend_point(|| 42u32);
-        // suspend_point returns once the snapshot is finished.
-        assert_eq!(snapshotter_done.load(Ordering::Acquire), 1);
+        // The pass is waiting for our operation to drain; suspending should let it proceed. The
+        // suspend closure must run for *both* kinds — see `suspend_point`'s comment on why GC
+        // suspensions are recorded too (a GC phase can hand its exclusion straight to a snapshot).
+        let recorded = Arc::new(AtomicUsize::new(0));
+        coord.suspend_point({
+            let recorded = recorded.clone();
+            move || {
+                recorded.fetch_add(1, Ordering::Release);
+                42u32
+            }
+        });
+        // `suspend_point` returns only once the pass has finished.
+        assert_eq!(
+            done.load(Ordering::Acquire),
+            1,
+            "{}: suspend_point must not return before the pass completes",
+            E::LABEL
+        );
+        assert_eq!(
+            recorded.load(Ordering::Acquire),
+            1,
+            "{}: the suspend closure must run so the operation is recorded for a possible snapshot",
+            E::LABEL
+        );
 
-        snap_thread.join().unwrap();
+        pass_thread.join().unwrap();
         drop(g);
+    }
+
+    #[test]
+    fn suspend_point_lets_snapshot_proceed() {
+        suspend_point_lets_exclusion_proceed::<SnapshotKind>();
+    }
+
+    #[test]
+    fn suspend_point_lets_gc_proceed() {
+        suspend_point_lets_exclusion_proceed::<GcKind>();
     }
 
     /// Run `body` on a worker thread and wait up to `timeout` for it to
@@ -594,5 +912,67 @@ mod tests {
             0,
             "in_progress_operations should be 0 after all ops and snapshots done"
         );
+    }
+
+    // === Garbage-collection gate ===
+
+    #[test]
+    fn into_snapshot_keeps_operations_excluded_across_handoff() {
+        // The GC->snapshot hand-off must never open a window in which an operation can start:
+        // exclusion is held continuously from `begin_gc` through the snapshot phase.
+        let coord = Arc::new(SnapshotCoordinator::<Op>::new());
+        let gc_phase = coord.begin_gc();
+
+        let started_op = Arc::new(AtomicUsize::new(0));
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let coord2 = coord.clone();
+        let op_thread = thread::spawn({
+            let started_op = started_op.clone();
+            let arrived = arrived.clone();
+            move || {
+                arrived.store(1, Ordering::Release);
+                let _guard = coord2.begin_operation();
+                started_op.store(1, Ordering::Release);
+            }
+        });
+
+        // Wait until the op thread is trying to begin (and thus blocked on the GC bit).
+        while arrived.load(Ordering::Acquire) == 0 {
+            thread::yield_now();
+        }
+        assert_eq!(started_op.load(Ordering::Acquire), 0);
+
+        // Hand off GC -> snapshot. The op must remain blocked (the snapshot bit is now set).
+        let snapshot_phase = gc_phase.into_snapshot();
+        // Give the op thread a chance to (wrongly) proceed if there were a gap.
+        for _ in 0..1000 {
+            thread::yield_now();
+        }
+        assert_eq!(
+            started_op.load(Ordering::Acquire),
+            0,
+            "operation started during the GC->snapshot hand-off — exclusion was released"
+        );
+
+        // Only once the snapshot phase ends may the operation proceed.
+        drop(snapshot_phase);
+        op_thread.join().unwrap();
+        assert_eq!(started_op.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be serialized")]
+    fn gc_during_snapshot_panics() {
+        let coord = SnapshotCoordinator::<Op>::new();
+        let _snap = coord.begin_snapshot();
+        let _gc = coord.begin_gc();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be serialized")]
+    fn snapshot_during_gc_panics() {
+        let coord = SnapshotCoordinator::<Op>::new();
+        let _gc = coord.begin_gc();
+        let _snap = coord.begin_snapshot();
     }
 }

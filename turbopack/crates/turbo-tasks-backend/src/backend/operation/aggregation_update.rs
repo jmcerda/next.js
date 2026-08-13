@@ -29,7 +29,10 @@ use turbo_tasks::{FxIndexMap, TaskExecutionReason, TaskId, TaskPriority, event::
 use crate::{
     backend::{
         TaskDataCategory,
-        operation::{ExecuteContext, Operation, TaskGuard, invalidate::make_task_dirty},
+        operation::{
+            ExecuteContext, Operation, TaskGuard, connect_child::resurrect_deleted,
+            invalidate::make_task_dirty,
+        },
         storage_schema::TaskStorageAccessors,
     },
     data::{ActivenessState, AggregationNumber, CollectibleRef},
@@ -1457,18 +1460,27 @@ impl AggregationUpdateQueue {
                     }
                 }
                 AggregationUpdateJob::AdjustParentCount { task_ids, delta } => {
-                    ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, _ctx| {
-                        task.update_and_get_parent_count(delta);
+                    ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, ctx| {
+                        if task.update_and_get_parent_count(delta) == 0 {
+                            debug_assert!(
+                                !task.id().is_transient(),
+                                "a transient task should never have a persistent parent_count to \
+                                 zero"
+                            );
+                            if task.is_gc_collectible() {
+                                ctx.note_gc_collectible(task.id());
+                            }
+                        }
                     });
                 }
                 AggregationUpdateJob::AdjustTransientRefCount { task_ids, delta } => {
-                    ctx.for_each_task_meta(
-                        task_ids,
-                        "AdjustTransientRefCount",
-                        |mut task, _ctx| {
-                            task.update_and_get_transient_ref_count(delta);
-                        },
-                    );
+                    ctx.for_each_task_meta(task_ids, "AdjustTransientRefCount", |mut task, ctx| {
+                        if task.update_and_get_transient_ref_count(delta) == 0
+                            && task.is_gc_collectible()
+                        {
+                            ctx.note_gc_collectible(task.id());
+                        }
+                    });
                 }
                 AggregationUpdateJob::DecreaseActiveCount { task } => {
                     self.decrease_active_count(ctx, task);
@@ -1618,7 +1630,7 @@ impl AggregationUpdateQueue {
                 "schedule tasks",
                 |task, ctx| {
                     let parent_priority = self.scheduled_tasks[&task.id()];
-                    ctx.schedule_task(task, parent_priority);
+                    ctx.schedule_task(&task, parent_priority);
                 },
             );
             self.scheduled_tasks.clear();
@@ -1935,6 +1947,10 @@ impl AggregationUpdateQueue {
                 if removed_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
+                    // if uppers became empty, it might be collectible, check now.
+                    if follower.is_upper_empty() && follower.is_gc_collectible() {
+                        ctx.note_gc_collectible(lost_follower_id);
+                    }
                     drop(follower);
 
                     // STEP 5
@@ -2011,6 +2027,9 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
+                    if upper.is_followers_empty() && upper.is_gc_collectible() {
+                        ctx.note_gc_collectible(upper_id);
+                    }
                     drop(upper);
 
                     // STEP 14
@@ -2109,6 +2128,9 @@ impl AggregationUpdateQueue {
             if !removed_uppers.is_empty() {
                 let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                 let followers = get_followers(&follower);
+                if follower.is_upper_empty() && follower.is_gc_collectible() {
+                    ctx.note_gc_collectible(lost_follower_id);
+                }
                 drop(follower);
 
                 // STEP 5
@@ -2189,6 +2211,9 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
+                    if upper.is_followers_empty() && upper.is_gc_collectible() {
+                        ctx.note_gc_collectible(upper_id);
+                    }
                     drop(upper);
 
                     // STEP 14
@@ -2297,6 +2322,9 @@ impl AggregationUpdateQueue {
                 if remove_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
+                    if follower.is_upper_empty() && follower.is_gc_collectible() {
+                        ctx.note_gc_collectible(lost_follower_id);
+                    }
                     drop(follower);
 
                     // STEP 5
@@ -2378,6 +2406,9 @@ impl AggregationUpdateQueue {
                 let has_active_count = ctx.should_track_activeness()
                     && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                 let upper_ids = get_uppers(&upper);
+                if upper.is_followers_empty() && upper.is_gc_collectible() {
+                    ctx.note_gc_collectible(upper_id);
+                }
                 drop(upper);
 
                 // STEP 14
@@ -3172,12 +3203,14 @@ impl AggregationUpdateQueue {
         #[cfg(feature = "trace_aggregation_update")]
         let _span = trace_span!("increase active count").entered();
 
-        let mut task = ctx.task(
+        let task = ctx.task(
             task_id,
             // For performance reasons this should stay Meta and not All.
             // persistent_task_type is now set eagerly in initialize_new_task.
             AGGREGATION_UPDATE_CATEGORY,
         );
+        // Revive the task if GC soft-deleted it.
+        let mut task = resurrect_deleted(task, task_id, self, ctx);
         self.check_optimization_pending(&task);
         let state = task.get_activeness_mut_or_insert_with(|| ActivenessState::new(task_id));
         let is_new = state.is_empty();

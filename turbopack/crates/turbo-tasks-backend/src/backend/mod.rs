@@ -1,6 +1,7 @@
 mod cell_data;
 mod counter_map;
 mod eviction;
+mod gc;
 mod operation;
 mod snapshot_coordinator;
 mod storage;
@@ -214,6 +215,9 @@ pub struct TurboTasksBackend {
     /// `stop_and_wait`).
     snapshot_in_progress: Mutex<()>,
 
+    /// Experimental feature to enable dead tasks to be deleted from storage and ram.
+    gc_enabled: bool,
+
     stopping: AtomicBool,
     stopping_event: Event,
     idle_start_event: Event,
@@ -248,8 +252,24 @@ impl TurboTasksBackend {
         let next_task_id = backing_storage
             .next_free_task_id()
             .expect("Failed to get task id");
+
+        let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
+            .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
+        if gc_enabled
+            && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
+            && options.eviction_mode == EvictionMode::Off
+        {
+            eprintln!(
+                "warning: TURBO_ENGINE_GC is set but eviction is disabled on a ReadWrite backend; \
+                 GC would leave collected tasks resident forever. Forcing GC off. Enable eviction \
+                 ('auto'/'full') to use GC in this mode."
+            );
+            gc_enabled = false;
+        }
+
         Self {
             options,
+            gc_enabled,
             start_time: Instant::now(),
             persisted_task_id_factory: IdFactoryWithReuse::new(
                 next_task_id,
@@ -331,6 +351,13 @@ impl TurboTasksBackend {
         (had_new_data, counts)
     }
 
+    /// The number of persistent (non-transient) tasks resident in the map. Test-only hook; see
+    /// [`Storage::resident_persistent_task_count`] for why the metric excludes transient tasks.
+    #[doc(hidden)]
+    pub fn resident_persistent_task_count_for_testing(&self) -> usize {
+        self.storage.resident_persistent_task_count()
+    }
+
     /// The persistent `parent_count` of a resident task (0 if absent or not resident). Test-only
     /// hook for verifying incremental refcount maintenance.
     #[doc(hidden)]
@@ -349,9 +376,8 @@ impl TurboTasksBackend {
     }
 
     /// Opens `task` with the must-exist [`ExecuteContext::task`] and drops the guard. Test-only
-    /// hook to exercise the non-fabricating existence guarantee: this panics (debug builds) if
-    /// `task` exists in neither memory nor persistent storage (rather than fabricating a
-    /// blank).
+    /// hook to exercise the non-fabricating existence guarantee: this panics if `task` exists in
+    /// neither memory nor persistent storage (rather than fabricating a blank).
     #[doc(hidden)]
     pub fn assert_task_exists_for_testing(
         &self,
@@ -516,6 +542,7 @@ impl TurboTasksBackend {
         });
         let (mut task, mut reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
+        task.assert_not_deleted("read_task_output");
 
         fn listen_to_done_event(
             reader_description: Option<EventDescription>,
@@ -823,7 +850,7 @@ impl TurboTasksBackend {
         // done: true } it must have Output and would early return.
         let old = task.set_in_progress(in_progress_state);
         debug_assert!(old.is_none(), "InProgress already exists");
-        ctx.schedule_task(task, TaskPriority::Recomputation);
+        ctx.schedule_task(&task, TaskPriority::Recomputation);
 
         Ok(ReadOutcome::Scheduled(listener))
     }
@@ -890,6 +917,7 @@ impl TurboTasksBackend {
         });
         let (mut task, reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
+        task.assert_not_deleted("read_task_cell");
 
         let content = if final_read_hint {
             task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence)
@@ -973,7 +1001,7 @@ impl TurboTasksBackend {
             TaskExecutionReason::CellNotAvailable,
             EventDescription::new(|| task.get_task_desc_fn()),
         );
-        ctx.schedule_task(task, TaskPriority::Recomputation);
+        ctx.schedule_task(&task, TaskPriority::Recomputation);
 
         Ok(ReadOutcome::Scheduled(listener))
     }
@@ -1023,6 +1051,25 @@ impl TurboTasksBackend {
         // request bit, suspended_operations) assumes only one snapshot runs at
         // a time. Held for the entire snapshot lifecycle.
         let _snapshot_in_progress = self.snapshot_in_progress.lock();
+
+        // Hand the GC pass's exclusion straight to the snapshot (`into_snapshot`) so the collected
+        // tasks' tombstones (derived from the `deleted` flag) ride this same commit.
+        let mut snapshot_phase = if self.gc_enabled {
+            let gc_span = tracing::info_span!(
+                parent: parent_span.clone(),
+                "gc",
+                stats = tracing::field::Empty,
+                edges_deleted = tracing::field::Empty,
+            )
+            .entered();
+            let gc_phase = self.snapshot_coord.begin_gc();
+            let stats = self.gc_collect(turbo_tasks);
+            gc_span.record("stats", display(stats));
+            // transition into snapshot modeatomically
+            gc_phase.into_snapshot()
+        } else {
+            self.snapshot_coord.begin_snapshot()
+        };
         let start = Instant::now();
         // SystemTime for wall-clock timestamps in trace events (milliseconds
         // since epoch). Instant is monotonic but has no defined epoch, so it
@@ -1030,11 +1077,6 @@ impl TurboTasksBackend {
         let wall_start = SystemTime::now();
         debug_assert!(self.should_persist());
 
-        let mut snapshot_phase = {
-            let _span = tracing::info_span!("blocking").entered();
-            self.snapshot_coord.begin_snapshot()
-        };
-        // Enter snapshot mode, which atomically reads and resets the modified count.
         // Checking after start_snapshot ensures no concurrent increments can race.
         let (snapshot_guard, has_modifications) = self.storage.start_snapshot();
 
@@ -1254,48 +1296,70 @@ impl TurboTasksBackend {
                 unreachable!("transient task_ids should never be enqueued to be persisted");
             }
 
-            let encode_meta = inner.flags.meta_modified();
-            let encode_data = inner.flags.data_modified();
-
-            #[cfg(feature = "print_cache_item_size")]
-            if encode_data || encode_meta {
-                task_cache_stats
-                    .lock()
-                    .entry(TaskCacheStats::task_name(inner))
-                    .or_default()
-                    .add_counts(inner);
-            }
-
-            let meta = if encode_meta {
-                encode_category(task_id, inner, SpecificTaskDataCategory::Meta, buffer)
-            } else {
-                None
-            };
-
-            let data = if encode_data {
-                encode_category(task_id, inner, SpecificTaskDataCategory::Data, buffer)
-            } else {
-                None
-            };
-            let task_type_hash = if inner.flags.new_task() {
-                let task_type = inner.get_persistent_task_type().expect(
-                    "It is not possible for a new_task to not have a persistent_task_type.  Task \
-                     creation for persistent tasks uses a single ExecutionContextImpl for \
-                     creating the task (which sets new_task) and connect_child (which sets \
-                     persistent_task_type) and take_snapshot waits for all operations to complete \
-                     or suspend before we start snapshotting.  So task creation will always set \
-                     the task_type.",
+            // Tombstone deleted tasks, eviction will delete them from memory later.
+            if inner.flags.deleted() {
+                debug_assert!(
+                    !inner.flags.new_task(),
+                    "a scanned GC-deleted task must be persisted; new tasks are discarded by GC"
                 );
-                Some(compute_task_type_hash(task_type))
+                let task_type_hash = compute_task_type_hash(
+                    inner
+                        .get_persistent_task_type()
+                        .expect("a GC-deleted task must have a task type"),
+                );
+                SnapshotItem::Delete {
+                    task_id,
+                    task_type_hash,
+                }
             } else {
-                None
-            };
+                debug_assert!(
+                    !inner.gc_maybe_collectible(),
+                    "tasks scheduled for persistent must not be collectible, this implies a \
+                     missed task during GC"
+                );
+                let encode_meta = inner.flags.meta_modified();
+                let encode_data = inner.flags.data_modified();
 
-            SnapshotItem::Put {
-                task_id,
-                meta,
-                data,
-                task_type_hash,
+                #[cfg(feature = "print_cache_item_size")]
+                if encode_data || encode_meta {
+                    task_cache_stats
+                        .lock()
+                        .entry(TaskCacheStats::task_name(inner))
+                        .or_default()
+                        .add_counts(inner);
+                }
+
+                let meta = if encode_meta {
+                    encode_category(task_id, inner, SpecificTaskDataCategory::Meta, buffer)
+                } else {
+                    None
+                };
+
+                let data = if encode_data {
+                    encode_category(task_id, inner, SpecificTaskDataCategory::Data, buffer)
+                } else {
+                    None
+                };
+                let task_type_hash = if inner.flags.new_task() {
+                    let task_type = inner.get_persistent_task_type().expect(
+                        "It is not possible for a new_task to not have a persistent_task_type.  \
+                         Task creation for persistent tasks uses a single ExecutionContextImpl \
+                         for creating the task (which sets new_task) and connect_child (which \
+                         sets persistent_task_type) and take_snapshot waits for all operations to \
+                         complete or suspend before we start snapshotting.  So task creation will \
+                         always set the task_type.",
+                    );
+                    Some(compute_task_type_hash(task_type))
+                } else {
+                    None
+                };
+
+                SnapshotItem::Put {
+                    task_id,
+                    meta,
+                    data,
+                    task_type_hash,
+                }
             }
         };
 
@@ -1485,15 +1549,11 @@ impl TurboTasksBackend {
         }
         // eagerly drop the task cache before persisting
         self.storage.drop_task_cache();
-        if self.should_persist() {
-            // The task_cache is a pure perf cache backed by the DB and isn't read during the
-            // stop snapshot (no task creation runs concurrently with stop). Drop it before
-            // persisting to lower peak memory during the serialization/write.
-            if let Err(err) =
+        if self.should_persist()
+            && let Err(err) =
                 self.snapshot_and_persist(Span::current().into(), SnapshotReason::Stop, turbo_tasks)
-            {
-                eprintln!("Persisting failed during shutdown: {err:?}");
-            }
+        {
+            eprintln!("Persisting failed during shutdown: {err:?}");
         }
         self.storage.drop_contents();
         if let Err(err) = self.backing_storage.shutdown() {
@@ -1932,6 +1992,7 @@ impl TurboTasksBackend {
         {
             let mut ctx = self.execute_context(turbo_tasks);
             let mut task = ctx.task(task_id, TaskDataCategory::All);
+            task.assert_not_deleted("try_start_task_execution");
             task_type = task.get_task_type().to_owned();
             let once_task = matches!(task_type, TaskType::Transient(ref tt) if matches!(&**tt, TransientTask::Once(_)));
             if let Some(tasks) = task.prefetch() {
@@ -2529,7 +2590,7 @@ impl TurboTasksBackend {
             )
             .entered();
             let mut make_stale = true;
-            let dependent = ctx.task(dependent_task_id, TaskDataCategory::All);
+            let mut dependent = ctx.task(dependent_task_id, TaskDataCategory::All);
             let transient_task_type = dependent.get_transient_task_type();
             if transient_task_type.is_some_and(|tt| matches!(&**tt, TransientTask::Once(_))) {
                 // once tasks are never invalidated
@@ -2553,8 +2614,7 @@ impl TurboTasksBackend {
                 return;
             }
             make_task_dirty_internal(
-                dependent,
-                dependent_task_id,
+                &mut dependent,
                 make_stale,
                 #[cfg(feature = "task_dirty_cause")]
                 cause.clone(),
@@ -3114,6 +3174,7 @@ impl TurboTasksBackend {
     ) -> Result<TypedCellContent> {
         let mut ctx = self.execute_context(turbo_tasks);
         let task = ctx.task(task_id, TaskDataCategory::Data);
+        task.assert_not_deleted("try_read_own_task_cell");
         if let Some(content) = task.get_cell_data(&cell).cloned() {
             Ok(CellContent(Some(content)).into_typed(cell.type_id()))
         } else {
@@ -3132,6 +3193,7 @@ impl TurboTasksBackend {
         let mut collectibles = AutoMap::default();
         {
             let mut task = ctx.task(task_id, TaskDataCategory::All);
+            task.assert_not_deleted("read_task_collectibles");
             if task
                 .get_persistent_task_type()
                 .is_some_and(|t| !t.native_fn.is_root)
@@ -3756,6 +3818,14 @@ impl Backend for TurboTasksBackend {
 
     fn mark_own_task_as_finished(&self, task_id: TaskId, turbo_tasks: &TurboTasks<Self>) {
         self.mark_own_task_as_finished(task_id, turbo_tasks);
+    }
+
+    fn pin_task_for_gc(&self, task: TaskId, turbo_tasks: &TurboTasks<Self>) {
+        self.gc_pin(task, turbo_tasks);
+    }
+
+    fn unpin_task_for_gc(&self, task: TaskId, turbo_tasks: &TurboTasks<Self>) {
+        self.gc_unpin(task, turbo_tasks);
     }
 
     fn connect_task(
