@@ -39,6 +39,7 @@ import {
 
 import {
   applyOwnerStack,
+  isHangingPromiseRejectionError,
   makeDevtoolsIOAwarePromise,
   makeDynamicHangingPromise,
   makeRuntimeHangingPromise,
@@ -112,6 +113,8 @@ import {
 import * as Log from '../../build/output/log'
 import { getServerReact, getClientReact } from '../runtime-reacts.external'
 import { createPromiseWithResolvers } from '../../shared/lib/promise-with-resolvers'
+import { getTracer, type Span } from '../lib/trace/tracer'
+import { UseCacheSpan } from '../lib/trace/constants'
 
 interface PrivateCacheContext {
   readonly kind: 'private'
@@ -152,6 +155,101 @@ interface PublicCacheContext {
 }
 
 type CacheContext = PrivateCacheContext | PublicCacheContext
+
+type UseCacheTraceOutcome = 'hit' | 'miss' | 'stale' | 'bypass' | 'wait'
+type UseCacheTraceSource = 'resume-data' | 'handler' | 'generated'
+type UseCacheTraceJoin = 'intra-request' | 'cross-request'
+type UseCacheTraceReason =
+  | 'forced'
+  | 'draft-mode'
+  | 'dev-rewarm'
+  | 'stale'
+  | 'runtime-data'
+
+type UseCacheTraceResult = {
+  outcome: UseCacheTraceOutcome
+  source?: UseCacheTraceSource
+  reason?: UseCacheTraceReason
+  backgroundRefresh?: true
+}
+
+type UseCacheTrace = {
+  readonly span: Span
+  complete(): void
+  fail(error: unknown): void
+  ignore(): void
+  resolve(result: UseCacheTraceResult): void
+  setHandler(handler: 'default' | 'custom' | 'none'): void
+  setJoin(join: UseCacheTraceJoin): void
+  setSource(source: UseCacheTraceSource): void
+}
+
+function createUseCacheTrace(
+  span: Span | undefined,
+  done: ((error?: Error) => void) | undefined
+): UseCacheTrace | undefined {
+  if (!span || !done) {
+    return undefined
+  }
+
+  let source: UseCacheTraceSource | undefined
+  let result: UseCacheTraceResult | undefined
+  let finished = false
+
+  return {
+    span,
+    complete() {
+      if (finished) return
+      finished = true
+      if (result) {
+        span.setAttribute('next.cache.outcome', result.outcome)
+        if (result.source) {
+          span.setAttribute('next.cache.source', result.source)
+        }
+        if (result.reason) {
+          span.setAttribute('next.cache.reason', result.reason)
+        }
+        if (result.backgroundRefresh) {
+          span.setAttribute('next.cache.background_refresh', true)
+        }
+      }
+      done()
+    },
+    fail(error) {
+      if (finished) return
+      finished = true
+      if (source) {
+        span.setAttribute('next.cache.source', source)
+      }
+      done(
+        error instanceof Error
+          ? error
+          : new Error('use cache invocation threw a non-Error value')
+      )
+    },
+    ignore() {
+      result = {
+        outcome: 'bypass',
+        source,
+        reason: 'runtime-data',
+      }
+      this.complete()
+    },
+    resolve(value) {
+      result = value
+      source = value.source ?? source
+    },
+    setHandler(handler) {
+      span.setAttribute('next.cache.handler', handler)
+    },
+    setJoin(join) {
+      span.setAttribute('next.cache.joined', join)
+    },
+    setSource(value) {
+      source = value
+    },
+  }
+}
 
 export type CacheKeyParts =
   | [buildId: string, id: string, args: unknown[]]
@@ -702,7 +800,8 @@ function generateCacheEntry(
   encodedArguments: FormData | string,
   fn: (...args: unknown[]) => Promise<unknown>,
   timeoutError: UseCacheTimeoutError,
-  deadlockError: UseCacheDeadlockError | undefined
+  deadlockError: UseCacheDeadlockError | undefined,
+  tracingSpan?: Span
 ) {
   // We need to run this inside a clean AsyncLocalStorage snapshot so that the cache
   // generation cannot read anything from the context we're currently executing which
@@ -710,7 +809,8 @@ function generateCacheEntry(
   // Note: It is important that we await at least once before this because it lets us
   // pop out of any stack specific contexts as well - aka "Sync" Local Storage.
   return workStore.runInCleanSnapshot(
-    generateCacheEntryWithRestoredWorkStore,
+    generateCacheEntryWithRestoredTrace,
+    tracingSpan,
     workStore,
     cacheContext,
     clientReferenceManifest,
@@ -719,6 +819,30 @@ function generateCacheEntry(
     timeoutError,
     deadlockError
   )
+}
+
+function generateCacheEntryWithRestoredTrace(
+  tracingSpan: Span | undefined,
+  workStore: WorkStore,
+  cacheContext: CacheContext,
+  clientReferenceManifest: DeepReadonly<ClientReferenceManifest>,
+  encodedArguments: FormData | string,
+  fn: (...args: unknown[]) => Promise<unknown>,
+  timeoutError: UseCacheTimeoutError,
+  deadlockError: UseCacheDeadlockError | undefined
+) {
+  const generate = () =>
+    generateCacheEntryWithRestoredWorkStore(
+      workStore,
+      cacheContext,
+      clientReferenceManifest,
+      encodedArguments,
+      fn,
+      timeoutError,
+      deadlockError
+    )
+
+  return tracingSpan ? getTracer().withSpan(tracingSpan, generate) : generate()
 }
 
 function generateCacheEntryWithRestoredWorkStore(
@@ -1723,6 +1847,53 @@ export async function cache(
   originalFn: (...args: unknown[]) => Promise<unknown>,
   args: unknown[]
 ) {
+  const workStore = workAsyncStorage.getStore()
+  if (workStore?.useCacheProbeMode !== undefined) {
+    return cacheImpl(kind, id, boundArgsLength, originalFn, args)
+  }
+
+  return getTracer().trace(
+    UseCacheSpan.execute,
+    {
+      spanName: 'use cache',
+      attributes: {
+        'next.span_category': 'application',
+        'next.cache.kind': kind === 'private' ? 'private' : 'public',
+      },
+    },
+    async (span, done) => {
+      const cacheTrace = createUseCacheTrace(span, done)
+      try {
+        const result = await cacheImpl(
+          kind,
+          id,
+          boundArgsLength,
+          originalFn,
+          args,
+          cacheTrace
+        )
+        cacheTrace?.complete()
+        return result
+      } catch (error) {
+        if (isHangingPromiseRejectionError(error)) {
+          cacheTrace?.ignore()
+        } else {
+          cacheTrace?.fail(error)
+        }
+        throw error
+      }
+    }
+  )
+}
+
+async function cacheImpl(
+  kind: string,
+  id: string,
+  boundArgsLength: number,
+  originalFn: (...args: unknown[]) => Promise<unknown>,
+  args: unknown[],
+  cacheTrace?: UseCacheTrace
+) {
   const isPrivate = kind === 'private'
 
   // The default handler kind corresponds to the bare 'use cache' directive.
@@ -1758,6 +1929,7 @@ export async function cache(
         // We don't know if the cache itself is dynamic or runtime data,
         // but the prerender is over, so it doesn't need to participate
         // in runtime data tracking at all.
+        cacheTrace?.ignore()
         return makeUntrackedHangingPromise<never>(
           workUnitStore.renderSignal,
           workStore.route,
@@ -1819,6 +1991,13 @@ export async function cache(
       }
     }
   }
+  cacheTrace?.setHandler(
+    cacheHandler === undefined
+      ? 'none'
+      : isPrivate || isBuiltInCacheHandler(kind)
+        ? 'default'
+        : 'custom'
+  )
 
   const timeoutError = new UseCacheTimeoutError()
   Error.captureStackTrace(timeoutError, cache)
@@ -1860,6 +2039,7 @@ export async function cache(
       // "use cache: private" is dynamic in prerendering contexts.
       case 'prerender':
         // Private caches can read request data, which is runtime data.
+        cacheTrace?.ignore()
         return makeRuntimeHangingPromise(
           workUnitStore.renderSignal,
           workStore.route,
@@ -1867,6 +2047,7 @@ export async function cache(
           workUnitStore
         )
       case 'prerender-legacy':
+        cacheTrace?.ignore()
         return throwToInterruptStaticGeneration(
           expression,
           workStore,
@@ -2196,6 +2377,7 @@ export async function cache(
         if (dynamicAccessAbortController.signal.aborted) {
           // The dynamic access is a fallback params read, which is runtime
           // data.
+          cacheTrace?.ignore()
           return makeRuntimeHangingPromise(
             workUnitStore.renderSignal,
             workStore.route,
@@ -2341,6 +2523,7 @@ export async function cache(
         case 'prerender-runtime':
           // The cache key was marked dynamic because it depends on fallback
           // params, which are runtime data.
+          cacheTrace?.ignore()
           return makeRuntimeHangingPromise(
             workUnitStore.renderSignal,
             workStore.route,
@@ -2462,6 +2645,7 @@ export async function cache(
               // The entry is only excluded from *static* prerenders — the
               // 'prerender-runtime' case below serves it — so a runtime
               // prefetch would include this content.
+              cacheTrace?.ignore()
               return makeRuntimeHangingPromise(
                 workUnitStore.renderSignal,
                 workStore.route,
@@ -2585,6 +2769,7 @@ export async function cache(
                   // The entry was omitted only because this render ends
                   // before the post-shell stage; a render that reaches its
                   // post-shell stage would serve it.
+                  cacheTrace?.ignore()
                   return makeStageHangingPromise(
                     prerenderStore.renderSignal,
                     workStore.route,
@@ -2594,6 +2779,7 @@ export async function cache(
                 }
                 // An unprefetchable entry (stale < MIN_PREFETCHABLE_STALE) is
                 // excluded from runtime prerenders too.
+                cacheTrace?.ignore()
                 return makeDynamicHangingPromise(
                   prerenderStore.renderSignal,
                   workStore.route,
@@ -2697,6 +2883,11 @@ export async function cache(
           // (or there is no cacheSignal), so serve a plain stream.
           stream = streamA
         }
+
+        cacheTrace?.resolve({
+          outcome: isCacheEntryStale(rdcResult.entry) ? 'stale' : 'hit',
+          source: 'resume-data',
+        })
       } else {
         // Entry was discarded (e.g. due to recently revalidated tags)
         debug?.(
@@ -2736,6 +2927,7 @@ export async function cache(
             // function, which escapes the instrumentation.
             // The cache key depends on fallback params, which are runtime
             // data.
+            cacheTrace?.ignore()
             return makeRuntimeHangingPromise(
               workUnitStore.renderSignal,
               workStore.route,
@@ -2763,6 +2955,7 @@ export async function cache(
             // know whether a runtime prerender would resolve it. Treat it as
             // runtime data, conservatively: the cost is at most a redundant
             // runtime prefetch request.
+            cacheTrace?.ignore()
             return makeRuntimeHangingPromise(
               workUnitStore.renderSignal,
               workStore.route,
@@ -2820,6 +3013,8 @@ export async function cache(
           serializedCacheKey
         )
         cacheSignal?.endRead()
+        cacheTrace?.setJoin('intra-request')
+        cacheTrace?.ignore()
         return sharedCacheResult.hangingPromise
       }
 
@@ -2872,6 +3067,10 @@ export async function cache(
           cacheSignal,
           logPrefix
         )
+        cacheTrace?.setJoin('intra-request')
+        cacheTrace?.resolve({
+          outcome: completedInvocation === undefined ? 'wait' : 'hit',
+        })
       }
     }
   }
@@ -2988,6 +3187,8 @@ export async function cache(
             cacheSignal?.endRead()
             stream = sharedCacheResult.entry.fork()
             maybePropagateCacheEntryMetadata(cacheContext, metadata)
+            cacheTrace?.setJoin('cross-request')
+            cacheTrace?.resolve({ outcome: 'wait' })
 
             // The cross-request leader belongs to a different request with its
             // own RDC. Save to this request's RDC so its final prerender can
@@ -3038,6 +3239,8 @@ export async function cache(
             }
             cacheSignal?.endRead()
             resolvableSharedCacheResult.resolve(sharedCacheResult)
+            cacheTrace?.setJoin('cross-request')
+            cacheTrace?.ignore()
             return sharedCacheResult.hangingPromise
           }
         }
@@ -3072,6 +3275,7 @@ export async function cache(
 
         // We ignore existing cache entries when force revalidating.
         if (cacheHandler && !shouldForceRevalidate(workStore, workUnitStore)) {
+          cacheTrace?.setSource('handler')
           entry = await cacheHandler.get(cacheHandlerKey, implicitTags)
 
           // Check if this is a redirect entry (coarse key → specific key).
@@ -3183,6 +3387,7 @@ export async function cache(
                 type: 'prerender-dynamic',
                 hangingPromise,
               })
+              cacheTrace?.ignore()
               return hangingPromise
             case 'request': {
               if (process.env.NODE_ENV === 'development') {
@@ -3334,6 +3539,16 @@ export async function cache(
             cacheSignalReadEnded = false
           }
 
+          const forceRevalidationReason = getForceRevalidationReason(
+            workStore,
+            workUnitStore
+          )
+          const isForegroundStaleRevalidation =
+            entry !== undefined &&
+            willConsumerServerCache(workUnitStore) &&
+            isCacheEntryStale(entry, currentTime)
+
+          cacheTrace?.setSource('generated')
           const result = await generateCacheEntry(
             workStore,
             cacheContext,
@@ -3341,7 +3556,8 @@ export async function cache(
             encodedCacheKeyParts,
             fn,
             timeoutError,
-            deadlockError
+            deadlockError,
+            cacheTrace?.span
           )
 
           if (result.type === 'prerender-dynamic') {
@@ -3354,6 +3570,7 @@ export async function cache(
               resumeDataCache.dynamicCacheKeys.add(serializedCacheKey)
             }
             resolvableSharedCacheResult.resolve(result)
+            cacheTrace?.ignore()
             return result.hangingPromise
           }
 
@@ -3414,6 +3631,13 @@ export async function cache(
           resolvableSharedCacheResult.resolve({
             type: 'cached',
             entry: sharedCacheEntry,
+          })
+          cacheTrace?.resolve({
+            outcome: forceRevalidationReason ? 'bypass' : 'miss',
+            source: 'generated',
+            reason:
+              forceRevalidationReason ??
+              (isForegroundStaleRevalidation ? 'stale' : undefined),
           })
         } else {
           const entryMetadata: CacheResultMetadata = {
@@ -3579,6 +3803,19 @@ export async function cache(
             workStore.pendingRevalidateWrites ??= []
             workStore.pendingRevalidateWrites.push(revalidatePromise)
           }
+
+          cacheTrace?.resolve({
+            outcome: isCacheEntryStale(entry, currentTime) ? 'stale' : 'hit',
+            source: 'handler',
+            reason:
+              shouldTriggerBackgroundRevalidation &&
+              !isCacheEntryStale(entry, currentTime)
+                ? 'dev-rewarm'
+                : undefined,
+            backgroundRefresh: shouldTriggerBackgroundRevalidation
+              ? true
+              : undefined,
+          })
         }
       }
     } catch (error) {
@@ -3652,17 +3889,32 @@ function shouldForceRevalidate(
   workStore: WorkStore,
   workUnitStore: WorkUnitStore
 ): boolean {
-  if (workStore.isOnDemandRevalidate || workStore.isDraftMode) {
-    return true
+  return getForceRevalidationReason(workStore, workUnitStore) !== undefined
+}
+
+function getForceRevalidationReason(
+  workStore: WorkStore,
+  workUnitStore: WorkUnitStore
+):
+  | Extract<UseCacheTraceReason, 'forced' | 'draft-mode' | 'dev-rewarm'>
+  | undefined {
+  if (workStore.isOnDemandRevalidate) {
+    return 'forced'
+  }
+
+  if (workStore.isDraftMode) {
+    return 'draft-mode'
   }
 
   if (process.env.__NEXT_DEV_SERVER) {
     switch (workUnitStore.type) {
       case 'request':
         return workUnitStore.headers.get('cache-control') === 'no-cache'
+          ? 'dev-rewarm'
+          : undefined
       case 'cache':
       case 'private-cache':
-        return workUnitStore.forceRevalidate
+        return workUnitStore.forceRevalidate ? 'dev-rewarm' : undefined
       case 'prerender-runtime':
       case 'prerender':
       case 'prerender-client':
@@ -3676,7 +3928,14 @@ function shouldForceRevalidate(
     }
   }
 
-  return false
+  return undefined
+}
+
+function isCacheEntryStale(
+  entry: Pick<CacheEntry, 'timestamp' | 'revalidate'>,
+  currentTime = performance.timeOrigin + performance.now()
+): boolean {
+  return currentTime > entry.timestamp + entry.revalidate * 1000
 }
 
 function shouldDiscardCacheEntry(
