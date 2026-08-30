@@ -1,3 +1,24 @@
+//! Maintenance of the aggregation tree (`upper` / `followers` edges).
+//!
+//! # GC invariant: no aggregation edge may point at a GC-deleted task
+//!
+//! [`crate::backend::gc`] soft-deletes a task (`deleted` flag) after capturing and tearing down its
+//! outgoing edges, and a later eviction pass erases its storage entirely. That erase is only safe
+//! if nothing still references the task, so an `upper`/`followers` edge added to an already-deleted
+//! task would leave a live task pointing into freed storage.
+//!
+//! Every 0→1 edge add below therefore calls [`TaskGuard::assert_not_deleted`] on the endpoint(s) it
+//! holds. These are **probes, not guards**: they are `debug_assert!`s that cost nothing in release,
+//! and no site suppresses the add. Instrumented runs (the GC unit suites plus a cross-session
+//! dogfood) never tripped them, so on current evidence the hazard is unreachable and paying for a
+//! real guard is not justified. The probes exist to turn "unreachable" into a CI failure rather
+//! than an assumption, because task-id reuse depends on it.
+//!
+//! Only [`AggregationUpdateQueue::balance_edge`] holds guards for *both* endpoints and so checks
+//! both. At the other sites the opposite endpoint is a bare `TaskId`, and peeking its flags while
+//! holding the first guard would re-enter the same `DashMap` shard's write lock and deadlock;
+//! checking it would require acquiring the pair up front (`Storage::access_pair_mut`).
+
 use std::{
     cmp::max,
     collections::{VecDeque, hash_map::Entry as HashMapEntry},
@@ -1678,6 +1699,10 @@ impl AggregationUpdateQueue {
                 let upper_ids = get_uppers(&upper);
 
                 // Add the same amount of upper edges
+                // Probe: neither endpoint of a new aggregation edge may be GC-deleted.
+                // `balance_edge` is the one site holding both guards, so both are checked.
+                upper.assert_not_deleted("balance_edge add upper (upper endpoint)");
+                task.assert_not_deleted("balance_edge add upper (inner endpoint)");
                 if task.update_upper_count(upper_id, count) {
                     if task.upper_len().is_power_of_two() {
                         self.push_optimize_task(&mut task);
@@ -1741,6 +1766,8 @@ impl AggregationUpdateQueue {
                 let upper_ids = get_uppers(&upper);
 
                 // Add the same amount of follower edges
+                upper.assert_not_deleted("balance_edge add follower (upper endpoint)");
+                task.assert_not_deleted("balance_edge add follower (follower endpoint)");
                 if upper.update_followers_count(task_id, count) {
                     // May optimize the task
                     if upper.followers_len().is_power_of_two() {
@@ -2523,6 +2550,7 @@ impl AggregationUpdateQueue {
                 {
                     // STEP 3a
                     // It's a follower of the upper node
+                    upper.assert_not_deleted("inner_of_uppers_has_new_follower add follower");
                     if upper.update_followers_count(new_follower_id, count) {
                         // STEP 3b
                         // May optimize the task
@@ -2604,6 +2632,7 @@ impl AggregationUpdateQueue {
                     }
 
                     // STEP 6a
+                    new_follower.assert_not_deleted("inner_of_uppers_has_new_follower add upper");
                     if new_follower.update_upper_count(upper_id, count) {
                         // It's a new upper
                         // STEP 6b
@@ -2783,6 +2812,9 @@ impl AggregationUpdateQueue {
 
                             // STEP 3a
                             // It's a follower of the upper node
+                            upper.assert_not_deleted(
+                                "inner_of_upper_has_new_followers add follower",
+                            );
                             if upper.update_followers_count(*follower_id, *count) {
                                 // STEP 3b
                                 // May optimize the task
@@ -2877,6 +2909,7 @@ impl AggregationUpdateQueue {
                     }
 
                     // STEP 6a
+                    new_follower.assert_not_deleted("inner_of_upper_has_new_followers add upper");
                     if new_follower.update_upper_count(upper_id, count) {
                         // STEP 6b
                         if new_follower.upper_len().is_power_of_two() {
@@ -3023,6 +3056,7 @@ impl AggregationUpdateQueue {
 
                 // STEP 3a
                 // It's a follower of the upper node
+                upper.assert_not_deleted("inner_of_upper_has_new_follower add follower");
                 if upper.update_followers_count(new_follower_id, count) {
                     // STEP 3b
                     // May optimize the task
@@ -3089,6 +3123,7 @@ impl AggregationUpdateQueue {
                 let _span = trace_span!("new inner").entered();
 
                 // STEP 6a
+                new_follower.assert_not_deleted("inner_of_upper_has_new_follower add upper");
                 if new_follower.update_upper_count(upper_id, count) {
                     // STEP 6b
                     if new_follower.upper_len().is_power_of_two() {
@@ -3305,6 +3340,7 @@ impl AggregationUpdateQueue {
                 // When converted from leaf to aggregating node, all children become
                 // followers
                 let children: Vec<_> = task.iter_children().collect();
+                task.assert_not_deleted("update_aggregation_number materialize followers");
                 task.update_followers_counts(children.into_iter(), 1);
             }
 
