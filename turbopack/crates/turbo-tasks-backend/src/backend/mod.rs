@@ -1296,70 +1296,78 @@ impl TurboTasksBackend {
                 unreachable!("transient task_ids should never be enqueued to be persisted");
             }
 
-            // Tombstone deleted tasks, eviction will delete them from memory later.
-            if inner.flags.deleted() {
-                debug_assert!(
-                    !inner.flags.new_task(),
-                    "a scanned GC-deleted task must be persisted; new tasks are discarded by GC"
-                );
-                let task_type_hash = compute_task_type_hash(
-                    inner
-                        .get_persistent_task_type()
-                        .expect("a GC-deleted task must have a task type"),
-                );
-                SnapshotItem::Delete {
-                    task_id,
-                    task_type_hash,
+            if self.gc_enabled {
+                if inner.flags.deleted() {
+                    debug_assert!(
+                        !inner.flags.new_task(),
+                        "a scanned GC-deleted task must be persisted; new tasks are discarded by \
+                         GC"
+                    );
+                    let task_type_hash = compute_task_type_hash(
+                        inner
+                            .get_persistent_task_type()
+                            .expect("a GC-deleted task must have a task type"),
+                    );
+                    return SnapshotItem::Delete {
+                        task_id,
+                        task_type_hash,
+                    };
+                } else {
+                    debug_assert!(
+                        !inner.gc_maybe_collectible(),
+                        "tasks scheduled for persistent must not be collectible, this implies a \
+                         missed task during GC"
+                    );
                 }
             } else {
                 debug_assert!(
-                    !inner.gc_maybe_collectible(),
-                    "tasks scheduled for persistent must not be collectible, this implies a \
-                     missed task during GC"
+                    !inner.flags.deleted(),
+                    "Deleted flags should only be set by GC and it is disabled"
+                )
+            }
+
+            let encode_meta = inner.flags.meta_modified();
+            let encode_data = inner.flags.data_modified();
+
+            #[cfg(feature = "print_cache_item_size")]
+            if encode_data || encode_meta {
+                task_cache_stats
+                    .lock()
+                    .entry(TaskCacheStats::task_name(inner))
+                    .or_default()
+                    .add_counts(inner);
+            }
+
+            let meta = if encode_meta {
+                encode_category(task_id, inner, SpecificTaskDataCategory::Meta, buffer)
+            } else {
+                None
+            };
+
+            let data = if encode_data {
+                encode_category(task_id, inner, SpecificTaskDataCategory::Data, buffer)
+            } else {
+                None
+            };
+            let task_type_hash = if inner.flags.new_task() {
+                let task_type = inner.get_persistent_task_type().expect(
+                    "It is not possible for a new_task to not have a persistent_task_type.  Task \
+                     creation for persistent tasks uses a single ExecutionContextImpl for \
+                     creating the task (which sets new_task) and connect_child (which sets \
+                     persistent_task_type) and take_snapshot waits for all operations to complete \
+                     or suspend before we start snapshotting.  So task creation will always set \
+                     the task_type.",
                 );
-                let encode_meta = inner.flags.meta_modified();
-                let encode_data = inner.flags.data_modified();
+                Some(compute_task_type_hash(task_type))
+            } else {
+                None
+            };
 
-                #[cfg(feature = "print_cache_item_size")]
-                if encode_data || encode_meta {
-                    task_cache_stats
-                        .lock()
-                        .entry(TaskCacheStats::task_name(inner))
-                        .or_default()
-                        .add_counts(inner);
-                }
-
-                let meta = if encode_meta {
-                    encode_category(task_id, inner, SpecificTaskDataCategory::Meta, buffer)
-                } else {
-                    None
-                };
-
-                let data = if encode_data {
-                    encode_category(task_id, inner, SpecificTaskDataCategory::Data, buffer)
-                } else {
-                    None
-                };
-                let task_type_hash = if inner.flags.new_task() {
-                    let task_type = inner.get_persistent_task_type().expect(
-                        "It is not possible for a new_task to not have a persistent_task_type.  \
-                         Task creation for persistent tasks uses a single ExecutionContextImpl \
-                         for creating the task (which sets new_task) and connect_child (which \
-                         sets persistent_task_type) and take_snapshot waits for all operations to \
-                         complete or suspend before we start snapshotting.  So task creation will \
-                         always set the task_type.",
-                    );
-                    Some(compute_task_type_hash(task_type))
-                } else {
-                    None
-                };
-
-                SnapshotItem::Put {
-                    task_id,
-                    meta,
-                    data,
-                    task_type_hash,
-                }
+            SnapshotItem::Put {
+                task_id,
+                meta,
+                data,
+                task_type_hash,
             }
         };
 
