@@ -9,7 +9,7 @@ use crate::{
     backend::{
         TaskDataCategory,
         operation::{
-            AggregatedDataUpdate, ExecuteContext, Operation,
+            AggregatedDataUpdate, ExecuteContext, Operation, TaskGuard,
             aggregation_update::{
                 AggregationUpdateJob, AggregationUpdateQueue, InnerOfUppersLostFollowersJob,
                 get_aggregation_number, get_uppers, is_aggregating_node,
@@ -75,6 +75,40 @@ pub fn capture_all_outgoing_edges(task: &impl TaskStorageAccessors) -> Vec<Outda
             .map(OutdatedEdge::CollectiblesDependency),
     );
     old_edges
+}
+
+/// The category to open a dependency *target* with when scrubbing its incoming edge.
+///
+/// Removing the edge only needs `Data`, but a GC pass also wants to know whether the target just
+/// became collectible, and that check reads `Meta` (see [`note_if_now_collectible`]). Outside a GC
+/// context the collector is a no-op, so stay with `Data` rather than forcing a Meta restore on the
+/// ordinary invalidation path.
+fn dependent_scrub_category<'e, C: ExecuteContext<'e>>(ctx: &C) -> TaskDataCategory {
+    if ctx.collects_gc_candidates() {
+        TaskDataCategory::All
+    } else {
+        TaskDataCategory::Data
+    }
+}
+
+/// Notify GC when removing an incoming dependency edge just made `task` collectible.
+///
+/// GC refuses to collect a task that any other task still depends on (see
+/// [`TaskStorage::gc_has_dependents`]), so losing the last such edge is a genuine
+/// live -> collectible transition. Without this the task would not be collected until a *later*
+/// pass rediscovered it in a shard scan, which is why a diamond (readers each holding a
+/// forward-dep on a target) used to need two passes to drain.
+///
+/// The other direction — losing the last parent — is noted by
+/// `AggregationUpdateJob::AdjustParentCount`; this is the dependency-edge counterpart.
+///
+/// Only does anything in a GC context, and expects a guard opened via
+/// [`dependent_scrub_category`] so that `is_gc_collectible` can see the Data-category dependent
+/// sets and give an exact answer rather than a pre-filter's.
+fn note_if_now_collectible<'e, C: ExecuteContext<'e>>(task: &mut C::TaskGuardImpl, ctx: &mut C) {
+    if ctx.collects_gc_candidates() && task.is_gc_collectible() {
+        ctx.note_gc_collectible(task.id());
+    }
 }
 
 #[cfg(feature = "trace_aggregation_update_stats")]
@@ -217,11 +251,13 @@ impl CleanupOldEdgesOperation {
                                     cell,
                                 } = forward;
                                 {
-                                    let mut task = ctx.task(cell_task_id, TaskDataCategory::Data);
+                                    let category = dependent_scrub_category(ctx);
+                                    let mut task = ctx.task(cell_task_id, category);
                                     task.remove_cell_dependents(&CellRef {
                                         task: task_id,
                                         cell,
                                     });
+                                    note_if_now_collectible(&mut task, ctx);
                                 }
                                 {
                                     let mut task = ctx.task(task_id, TaskDataCategory::Data);
@@ -235,7 +271,8 @@ impl CleanupOldEdgesOperation {
                                     cell,
                                 } = forward;
                                 {
-                                    let mut task = ctx.task(cell_task_id, TaskDataCategory::Data);
+                                    let category = dependent_scrub_category(ctx);
+                                    let mut task = ctx.task(cell_task_id, category);
                                     task.remove_cell_dependents_hashed(&(
                                         CellRef {
                                             task: task_id,
@@ -243,6 +280,7 @@ impl CleanupOldEdgesOperation {
                                         },
                                         key,
                                     ));
+                                    note_if_now_collectible(&mut task, ctx);
                                 }
                                 {
                                     let mut task = ctx.task(task_id, TaskDataCategory::Data);
@@ -258,8 +296,10 @@ impl CleanupOldEdgesOperation {
                                 )
                                 .entered();
                                 {
-                                    let mut task = ctx.task(output_task_id, TaskDataCategory::Data);
+                                    let category = dependent_scrub_category(ctx);
+                                    let mut task = ctx.task(output_task_id, category);
                                     task.remove_output_dependent(&task_id);
+                                    note_if_now_collectible(&mut task, ctx);
                                 }
                                 {
                                     let mut task = ctx.task(task_id, TaskDataCategory::Data);
@@ -271,12 +311,13 @@ impl CleanupOldEdgesOperation {
                                 task: dependent_task_id,
                             }) => {
                                 {
-                                    let mut task =
-                                        ctx.task(dependent_task_id, TaskDataCategory::Data);
+                                    let category = dependent_scrub_category(ctx);
+                                    let mut task = ctx.task(dependent_task_id, category);
                                     task.remove_collectibles_dependents(&(
                                         collectible_type,
                                         task_id,
                                     ));
+                                    note_if_now_collectible(&mut task, ctx);
                                 }
                                 {
                                     let mut task = ctx.task(task_id, TaskDataCategory::Data);

@@ -858,7 +858,34 @@ impl TaskStorage {
         self.get_transient_ref_count().copied().unwrap_or(0)
     }
 
-    /// Whether there are any live references to this task.
+    /// Whether a GC pass may collect this task.
+    ///
+    /// Answers "is anything still referencing this task", across every kind of incoming reference:
+    /// parents (`parent_count`), transient pins, aggregation edges (`upper`/`followers`), and
+    /// dependency edges (`output_dependent`, `cell_dependents`, `cell_dependents_hashed`,
+    /// `collectibles_dependents`).
+    ///
+    /// # Restore-dependent precision
+    ///
+    /// The clauses live in two different storage categories, so how much this can prove depends on
+    /// what the caller has restored:
+    ///
+    /// - **Meta not restored** → `false`. None of the clauses can be evaluated.
+    /// - **Meta only** → checks everything except the dependency edges (three of those four sets
+    ///   are Data). Sound as a *pre-filter*: a task it rejects is definitely not collectible, but a
+    ///   task it accepts may still have dependents.
+    /// - **Meta + Data** → the full predicate.
+    ///
+    /// This is deliberately conservative in one direction only, which is what lets the cheap
+    /// Meta-only shard scan and the authoritative under-guard recheck share a single predicate. The
+    /// scan never forces a Data restore; the GC loop re-verifies with `TaskDataCategory::All` open
+    /// before collecting anything, and that is the check that actually gates collection.
+    ///
+    /// Refusing to collect a task with dependents is also what makes task-id reuse safe: a
+    /// hard-deleted task's id can be handed out again, so a surviving dependent edge would silently
+    /// resolve to an unrelated live task instead of tripping the `MustExist` "exists in neither
+    /// memory nor persistent storage" check. A dependent on a parentless task means the dependent
+    /// is itself dead or mid-invalidation.
     pub fn gc_maybe_collectible(&self) -> bool {
         // None of the predicates below are correct without this.
         self.flags.is_restored(TaskDataCategory::Meta)
@@ -873,6 +900,18 @@ impl TaskStorage {
             // It is rare for upper/followers to be present when the ref counts are 0 but it can happen transiently during a concurrent GC pass as uppers are moved around during the cascade.
             && self.upper().is_empty()
             && self.followers().is_none_or(|f| f.is_empty())
+            // `collectibles_dependents` is Meta, so it is always checkable here.
+            && self
+                .collectibles_dependents()
+                .is_none_or(|d| d.is_empty())
+            // The remaining dependent sets are Data; skipped (leaving this a pre-filter) when Data
+            // is not restored.
+            && (!self.flags.is_restored(TaskDataCategory::Data)
+                || (self.output_dependent().is_empty()
+                    && self.cell_dependents().is_none_or(|d| d.is_empty())
+                    && self
+                        .cell_dependents_hashed()
+                        .is_none_or(|d| d.is_empty())))
     }
 }
 

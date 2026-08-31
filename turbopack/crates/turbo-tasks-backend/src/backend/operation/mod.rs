@@ -136,6 +136,11 @@ pub trait ExecuteContext<'e>: Sized {
     /// Use to record tasks that become collectible during execution of this context.
     /// Only a GC context accumulates these; a normal operation context discards them.
     fn note_gc_collectible(&mut self, task_id: TaskId);
+    /// Whether [`Self::note_gc_collectible`] does anything, i.e. this is a GC context.
+    ///
+    /// Lets a caller skip work that only exists to feed the collector — in particular opening a
+    /// task with a wider [`TaskDataCategory`] than it would otherwise need.
+    fn collects_gc_candidates(&self) -> bool;
     fn should_track_dependencies(&self) -> bool;
     fn should_track_activeness(&self) -> bool;
     fn turbo_tasks(&self) -> Arc<dyn TurboTasksCallApi>;
@@ -1163,6 +1168,10 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
         }
     }
 
+    fn collects_gc_candidates(&self) -> bool {
+        self.gc_collectible.is_some()
+    }
+
     fn should_track_dependencies(&self) -> bool {
         self.backend.should_track_dependencies()
     }
@@ -1355,11 +1364,11 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         new_value
     }
 
-    /// Whether a GC pass may collect this task:
+    /// Whether a GC pass may collect this task: it is non-transient and nothing references it.
     ///
-    /// It is collectible if it is non-transient, has no persistent or transient
-    /// parents, is quiescent (not active, not in progress), and holds no aggregation edges
-    /// (`upper`/`followers`).
+    /// How much this proves depends on the guard's category — with only `Meta` open it is a sound
+    /// pre-filter that cannot see dependency edges, and with `All` open it is authoritative. See
+    /// [`TaskStorage::gc_maybe_collectible`] for the full contract.
     fn is_gc_collectible(&self) -> bool {
         // Transient-ness is a property of the id, not the storage; transient tasks are never
         // collected.
