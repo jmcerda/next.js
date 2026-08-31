@@ -1483,23 +1483,14 @@ impl AggregationUpdateQueue {
                 AggregationUpdateJob::AdjustParentCount { task_ids, delta } => {
                     ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, ctx| {
                         if task.update_and_get_parent_count(delta) == 0 {
-                            debug_assert!(
-                                !task.id().is_transient(),
-                                "a transient task should never have a persistent parent_count to \
-                                 zero"
-                            );
-                            if task.is_gc_collectible() {
-                                ctx.note_gc_collectible(task.id());
-                            }
+                            ctx.note_maybe_collectible(&task);
                         }
                     });
                 }
                 AggregationUpdateJob::AdjustTransientRefCount { task_ids, delta } => {
                     ctx.for_each_task_meta(task_ids, "AdjustTransientRefCount", |mut task, ctx| {
-                        if task.update_and_get_transient_ref_count(delta) == 0
-                            && task.is_gc_collectible()
-                        {
-                            ctx.note_gc_collectible(task.id());
+                        if task.update_and_get_transient_ref_count(delta) == 0 {
+                            ctx.note_maybe_collectible(&task);
                         }
                     });
                 }
@@ -1975,8 +1966,8 @@ impl AggregationUpdateQueue {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
                     // if uppers became empty, it might be collectible, check now.
-                    if follower.is_upper_empty() && follower.is_gc_collectible() {
-                        ctx.note_gc_collectible(lost_follower_id);
+                    if follower.is_upper_empty() {
+                        ctx.note_maybe_collectible(&follower);
                     }
                     drop(follower);
 
@@ -2054,8 +2045,8 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    if upper.is_followers_empty() && upper.is_gc_collectible() {
-                        ctx.note_gc_collectible(upper_id);
+                    if upper.is_followers_empty() {
+                        ctx.note_maybe_collectible(&upper);
                     }
                     drop(upper);
 
@@ -2155,8 +2146,8 @@ impl AggregationUpdateQueue {
             if !removed_uppers.is_empty() {
                 let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                 let followers = get_followers(&follower);
-                if follower.is_upper_empty() && follower.is_gc_collectible() {
-                    ctx.note_gc_collectible(lost_follower_id);
+                if follower.is_upper_empty() {
+                    ctx.note_maybe_collectible(&follower);
                 }
                 drop(follower);
 
@@ -2238,8 +2229,8 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    if upper.is_followers_empty() && upper.is_gc_collectible() {
-                        ctx.note_gc_collectible(upper_id);
+                    if upper.is_followers_empty() {
+                        ctx.note_maybe_collectible(&upper);
                     }
                     drop(upper);
 
@@ -2349,8 +2340,8 @@ impl AggregationUpdateQueue {
                 if remove_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
-                    if follower.is_upper_empty() && follower.is_gc_collectible() {
-                        ctx.note_gc_collectible(lost_follower_id);
+                    if follower.is_upper_empty() {
+                        ctx.note_maybe_collectible(&follower);
                     }
                     drop(follower);
 
@@ -2433,8 +2424,8 @@ impl AggregationUpdateQueue {
                 let has_active_count = ctx.should_track_activeness()
                     && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                 let upper_ids = get_uppers(&upper);
-                if upper.is_followers_empty() && upper.is_gc_collectible() {
-                    ctx.note_gc_collectible(upper_id);
+                if upper.is_followers_empty() {
+                    ctx.note_maybe_collectible(&upper);
                 }
                 drop(upper);
 

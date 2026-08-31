@@ -41,6 +41,7 @@ fn create_tt() -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
             small_preallocation: false,
             storage_mode: Some(StorageMode::ReadWriteOnShutdown),
             eviction_mode: EvictionMode::Full,
+            gc: Some(true),
             ..Default::default()
         },
         turbo_tasks_backend::turbo_backing_storage(

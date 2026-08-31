@@ -133,9 +133,18 @@ pub trait ExecuteContext<'e>: Sized {
     fn operation_suspend_point<T>(&mut self, op: &T)
     where
         T: Clone + Into<AnyOperation>;
-    /// Use to record tasks that become collectible during execution of this context.
-    /// Only a GC context accumulates these; a normal operation context discards them.
-    fn note_gc_collectible(&mut self, task_id: TaskId);
+    /// Record `task` as a GC candidate **if it is in fact collectible**.
+    ///
+    /// Call this wherever an operation removes the last reference of some kind to a task. This may
+    /// be a transition to collectibility.
+    ///
+    /// Only effective in a gc context see [`Self::collects_gc_candidates`].
+    fn note_maybe_collectible(&mut self, task: &impl TaskGuard);
+    /// Whether [`Self::note_maybe_collectible`] does anything, i.e. this is a GC context.
+    ///
+    /// Lets a caller skip work that only exists to feed the collector — in particular opening a
+    /// task with a wider [`TaskDataCategory`] than it would otherwise need.
+    fn collects_gc_candidates(&self) -> bool;
     fn should_track_dependencies(&self) -> bool;
     fn should_track_activeness(&self) -> bool;
     fn turbo_tasks(&self) -> Arc<dyn TurboTasksCallApi>;
@@ -1157,10 +1166,16 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
         self.backend.operation_suspend_point(|| op.clone().into());
     }
 
-    fn note_gc_collectible(&mut self, task_id: TaskId) {
-        if let Some(collector) = self.gc_collectible {
-            collector(task_id);
+    fn note_maybe_collectible(&mut self, task: &impl TaskGuard) {
+        if let Some(collector) = self.gc_collectible
+            && task.is_gc_collectible()
+        {
+            collector(task.id());
         }
+    }
+
+    fn collects_gc_candidates(&self) -> bool {
+        self.gc_collectible.is_some()
     }
 
     fn should_track_dependencies(&self) -> bool {
@@ -1355,11 +1370,11 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         new_value
     }
 
-    /// Whether a GC pass may collect this task:
+    /// Whether a GC pass may collect this task: it is non-transient and nothing references it.
     ///
-    /// It is collectible if it is non-transient, has no persistent or transient
-    /// parents, is quiescent (not active, not in progress), and holds no aggregation edges
-    /// (`upper`/`followers`).
+    /// How much this proves depends on the guard's category — with only `Meta` open it is a sound
+    /// pre-filter that cannot see dependency edges, and with `All` open it is authoritative. See
+    /// [`TaskStorage::gc_maybe_collectible`] for the full contract.
     fn is_gc_collectible(&self) -> bool {
         // Transient-ness is a property of the id, not the storage; transient tasks are never
         // collected.

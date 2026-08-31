@@ -87,8 +87,11 @@ impl TurboTasksBackend {
                 // `All` restores Data so the edge capture below can read the Data-category dep
                 // sets.
                 let mut task = ctx.task(task_id, TaskDataCategory::All);
-                // Recheck under the guard: a racing teardown can add uppers/followers that
-                // temporarily remove collectibility. Such a task is re-enqueued by a later pass.
+                // Recheck under the guard, and note that this is the **authoritative** check:
+                // the shard scan that produced this candidate only had Meta, so it could not see
+                // dependency edges (see `TaskStorage::gc_maybe_collectible`). With `All` open the
+                // same predicate is exact. A racing teardown can also add uppers/followers that
+                // temporarily remove collectibility; such a task is re-enqueued by a later pass.
                 if !task.is_gc_collectible() {
                     return ControlFlow::Continue(());
                 }
@@ -155,6 +158,15 @@ impl TurboTasksBackend {
     /// Runs a full GC pass under the GC phase and returns the number of tasks collected.
     #[doc(hidden)]
     pub fn gc_for_testing(&self, turbo_tasks: &TurboTasks<TurboTasksBackend>) -> usize {
+        // A pass sets `deleted` flags, and the persist path only knows how to tombstone those when
+        // GC is enabled. Running a pass on a GC-disabled backend would leave soft-deleted tasks
+        // that persistence refuses to handle, so require the backend to be configured for GC
+        // (`BackendOptions::gc` or `TURBO_ENGINE_GC`) rather than silently diverging from
+        // production.
+        assert!(
+            self.gc_enabled,
+            "gc_for_testing requires a GC-enabled backend: set `BackendOptions::gc = Some(true)`"
+        );
         let _serialize = self.snapshot_in_progress.lock();
         let _gc_phase = self.snapshot_coord.begin_gc();
         self.gc_collect(turbo_tasks).collected

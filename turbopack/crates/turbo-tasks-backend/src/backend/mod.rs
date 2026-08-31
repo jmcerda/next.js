@@ -148,6 +148,10 @@ pub struct BackendOptions {
     /// This reclaims memory by clearing persisted data that can be re-loaded from disk on demand.
     /// This is an EXPERIMENTAL FEATURE under development
     pub eviction_mode: EvictionMode,
+
+    /// Overrides whether the reference-counting GC runs for this backend. `None` (default) derives
+    /// it from the `TURBO_ENGINE_GC` env var;
+    pub gc: Option<bool>,
 }
 
 impl Default for BackendOptions {
@@ -159,6 +163,7 @@ impl Default for BackendOptions {
             num_workers: None,
             small_preallocation: false,
             eviction_mode: EvictionMode::Off,
+            gc: None,
         }
     }
 }
@@ -253,15 +258,17 @@ impl TurboTasksBackend {
             .next_free_task_id()
             .expect("Failed to get task id");
 
-        let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
-            .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
+        let mut gc_enabled = options.gc.unwrap_or_else(|| {
+            std::env::var_os("TURBO_ENGINE_GC")
+                .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")))
+        });
         if gc_enabled
             && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
             && options.eviction_mode == EvictionMode::Off
         {
             eprintln!(
-                "warning: TURBO_ENGINE_GC is set but eviction is disabled on a ReadWrite backend; \
-                 GC would leave collected tasks resident forever. Forcing GC off. Enable eviction \
+                "warning: GC is enabled but eviction is disabled on a ReadWrite backend; GC would \
+                 leave collected tasks resident forever. Forcing GC off. Enable eviction \
                  ('auto'/'full') to use GC in this mode."
             );
             gc_enabled = false;
