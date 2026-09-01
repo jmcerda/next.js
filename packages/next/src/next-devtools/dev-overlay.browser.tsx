@@ -90,6 +90,7 @@ export interface Dispatcher {
 
 type Dispatch = ReturnType<typeof useErrorOverlayReducer>[1]
 const eventQueue = new EventQueue<Dispatch>()
+let consumeErrorFatalityForEvent: (error: Error) => boolean = () => false
 
 function loadDevOverlayUX() {
   const { DevOverlay, FontStyles } =
@@ -99,27 +100,54 @@ function loadDevOverlayUX() {
 
 // Global state store for accessing current overlay state from outside React context
 type OverlayStateWithRouter = OverlayState & { routerType: 'pages' | 'app' }
+export type SerializedRuntimeErrorState = Pick<
+  OverlayStateWithRouter,
+  'errors' | 'routerType'
+>
+type RuntimeErrorStateListener = (state: SerializedRuntimeErrorState) => void
 
 let currentOverlayState: OverlayStateWithRouter | null = null
+const runtimeErrorStateListeners = new Set<RuntimeErrorStateListener>()
+
+function serializeRuntimeErrors(errors: OverlayState['errors']) {
+  // Serialize Error properties because they are non-enumerable.
+  return errors.map((errorEvent: any) => ({
+    ...errorEvent,
+    error: errorEvent.error
+      ? {
+          name: errorEvent.error.name,
+          message: errorEvent.error.message,
+          stack: errorEvent.error.stack,
+        }
+      : null,
+  }))
+}
+
+function serializeOverlayState(
+  state: OverlayStateWithRouter
+): OverlayStateWithRouter {
+  return {
+    ...state,
+    errors: serializeRuntimeErrors(state.errors),
+  }
+}
 
 export function getSerializedOverlayState(): OverlayStateWithRouter | null {
-  // Serialize error objects properly since Error properties are non-enumerable
-  // This is used when sending state via HMR/JSON.stringify
   if (!currentOverlayState) return null
+  return serializeOverlayState(currentOverlayState)
+}
 
-  return {
-    ...currentOverlayState,
-    errors: currentOverlayState.errors.map((errorEvent: any) => ({
-      ...errorEvent,
-      error: errorEvent.error
-        ? {
-            name: errorEvent.error.name,
-            message: errorEvent.error.message,
-            stack: errorEvent.error.stack,
-          }
-        : null,
-    })),
+export function subscribeToRuntimeErrorState(
+  listener: RuntimeErrorStateListener
+): () => void {
+  runtimeErrorStateListeners.add(listener)
+
+  const state = getSerializedOverlayState()
+  if (state) {
+    listener({ errors: state.errors, routerType: state.routerType })
   }
+
+  return () => runtimeErrorStateListeners.delete(listener)
 }
 
 export function getSegmentTrieData(): SegmentTrieData | null {
@@ -194,12 +222,14 @@ export const dispatcher: Dispatcher = {
     dispatch({
       type: ACTION_UNHANDLED_ERROR,
       reason: error,
+      isFatal: consumeErrorFatalityForEvent(error),
     })
   }),
   onUnhandledRejection: createQueuable((dispatch: Dispatch, error: Error) => {
     dispatch({
       type: ACTION_UNHANDLED_REJECTION,
       reason: error,
+      isFatal: consumeErrorFatalityForEvent(error),
     })
   }),
   openErrorOverlay: createQueuable((dispatch: Dispatch) => {
@@ -279,6 +309,21 @@ function DevOverlayRoot({
     currentOverlayState = { ...state, routerType }
   }, [state, routerType])
 
+  useEffect(() => {
+    if (runtimeErrorStateListeners.size === 0) {
+      return
+    }
+
+    const runtimeErrorState = {
+      errors: serializeRuntimeErrors(state.errors),
+      routerType,
+    }
+
+    for (const listener of runtimeErrorStateListeners) {
+      listener(runtimeErrorState)
+    }
+  }, [state.errors, routerType])
+
   useLayoutEffect(() => {
     const portalNode = shadowRoot.host
     if (state.theme === 'dark') {
@@ -351,8 +396,11 @@ function getSquashedHydrationErrorDetailsApp() {
 export function renderAppDevOverlay(
   getOwnerStack: (error: Error) => string | null | undefined,
   isRecoverableError: (error: Error) => boolean,
+  consumeErrorFatality: (error: Error) => boolean,
   enableCacheIndicator: boolean
 ): void {
+  consumeErrorFatalityForEvent = consumeErrorFatality
+
   if (isPagesMounted) {
     // Switching between App and Pages Router is always a hard navigation
     // TODO: Support soft navigation between App and Pages Router
@@ -415,8 +463,11 @@ export function renderPagesDevOverlay(
   getSquashedHydrationErrorDetails: (
     error: Error
   ) => HydrationErrorState | null,
-  isRecoverableError: (error: Error) => boolean
+  isRecoverableError: (error: Error) => boolean,
+  consumeErrorFatality: (error: Error) => boolean
 ): void {
+  consumeErrorFatalityForEvent = consumeErrorFatality
+
   if (isAppMounted) {
     // Switching between App and Pages Router is always a hard navigation
     // TODO: Support soft navigation between App and Pages Router

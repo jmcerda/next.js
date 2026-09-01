@@ -3,7 +3,7 @@
  *
  * This tool provides comprehensive error reporting including:
  * - Next.js global errors (e.g., next.config validation errors)
- * - Browser runtime errors with source-mapped stack traces
+ * - Browser runtime errors with fatality and source-mapped stack traces
  * - Build errors from webpack/turbopack compilation
  *
  * For browser errors, it leverages the HMR infrastructure for server-to-browser communication.
@@ -37,7 +37,7 @@ export function registerGetErrorsTool(
     'get_errors',
     {
       description:
-        'Get the current error state from the Next.js dev server, including Next.js global errors (e.g., next.config validation), browser runtime errors, and build errors with source-mapped stack traces',
+        'Get the current error state from the Next.js dev server, including Next.js global errors (e.g., next.config validation), browser runtime errors with fatality, and build errors with source-mapped stack traces',
       inputSchema: {},
     },
     async (_request) => {
